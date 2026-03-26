@@ -1,0 +1,87 @@
+# Full MHD-like disruption simulation — GPU demo
+# Tuned for visible ELM cycles + disruption events on 512x512
+
+grid:
+  Nx: 512
+  Ny: 512
+  wall_radius: 0.45
+  g_noise_init: 0.05
+  heat_profile:
+    cx: 0.5
+    cy: 0.5
+    rx: 0.2
+    ry: 0.2
+    peak: 1.0
+
+time:
+  dt: 0.005
+
+# --- Transport ---
+transport:
+  D_E: 0.4
+  D_x: 0.08
+  C_adv: 1.5        # advection strength — drives cross-field transport
+  gamma_diss: 0.8    # dissipation — prevents unbounded energy growth
+  eta_ctrl: 0.3      # control-to-energy coupling
+
+# --- Symmetric tensor S ---
+tensor_S:
+  tau_0: 1.0
+  kappa_aniso: 20.0
+  noise: 0.6         # noise proportional to sqrt(E), destabilizes high-E
+  eig_lo: 0.25
+  eig_hi: 6.0
+
+# --- Resolution & observation ---
+resolution:
+  l0: 0.5
+  alpha: 1.0
+
+observer:
+  sigma_G: 0.3
+  E_noise_beta: 0.25
+
+# --- Controller ---
+controller:
+  type: aniso_aware
+  gain: 2.0
+  u_max: 4.0
+  period: 5.0
+  duty: 0.5
+  trigger: 0.4
+  hysteresis: 0.6
+  anticipation: 5.0
+  ki: 0.3
+  kd: 0.05
+
+# --- Heater ---
+heater:
+  type: target
+  power: 5.0         # strong heating to build pedestal
+  period: 2.0
+  duty: 0.6
+  trigger: 0.5
+  hysteresis: 1.5
+  E_target: 2.0      # target center-E for target heater
+  k_heat: 2.0
+
+# --- G response model ---
+g_response:
+  type: relax_aniso
+  tau: 1.0
+  kappa: 20.0
+  noise: 0.6
+  nu: 0.5
+
+# --- Coupling ---
+coupling:
+  alpha: 0.5
+  gamma: 1.0
+
+# --- ELM / Disruption ---
+elm:
+  gradient_crit: 2.5   # critical ∇E for ballooning onset
+  drive: 8.0           # ELM burst amplitude
+
+E_target: 2.0          # reference target for fusion margin metric
+seed: 42

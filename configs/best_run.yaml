@@ -1,0 +1,84 @@
+# Realistic energy dissipation: radiation, wall model, beta-limit
+
+grid:
+  Nx: 256
+  Ny: 256
+
+transport:
+  D_E: 0.0
+  D_x: 6.2e-6
+  C_adv: 6.2e-6
+  gamma_diss: 0.0
+  eta_ctrl: 0.3
+
+radiation:
+  gamma_rad: 0.001
+  rad_exp: 1.5
+
+wall:
+  radius: 0.45
+  cooling: 0.5
+  E_max: 50.0
+
+beta:
+  limit: 150.0
+  thermal_quench_frac: 0.8
+
+tensor_S:
+  tau_0: 1.0
+  kappa_aniso: 20.0
+  noise_S: 0.1
+  eig_lo: 0.5
+  eig_hi: 30.0
+
+resolution:
+  l0: 0.5
+  alpha: 1.0
+
+observer:
+  sigma_G: 0.1
+  E_noise_beta: 0.005
+
+controller:
+  type: pulsed
+  gain: 0.5
+  u_max: 20.0
+  trigger: 0.1
+  hysteresis: 0.6
+  anticipation: 2.0
+  ki: 0.5
+  kd: 0.1
+  delay_tau: 0.0
+
+heater:
+  type: target
+  power: 2.0
+  period: 2.0
+  duty: 0.6
+  trigger: 0.5
+  hysteresis: 1.5
+  E_target: 1.5
+  k_heat: 2.0
+  cx: 0.5
+  cy: 0.5
+  rx: 0.06
+  ry: 0.06
+  peak: 1.0
+
+g_response:
+  type: gradient
+  grad_S0: 0.0
+  grad_kappa: 2.0
+  grad_tau: 0.3
+  grad_E_ref: 1.0
+
+coupling:
+  alpha: 1.5
+  gamma: 1.2
+
+elm:
+  gradient_crit: 30.0
+  drive: 3.0
+  energy_frac: 0.02
+
+E_target: 1.5
