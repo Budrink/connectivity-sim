@@ -96,7 +96,7 @@ __global__ void k_init(GridFieldsPtrs f, SimParams p) {
         clamp_eig2x2(f.s00[k], f.s01[k], f.s11[k], p.eig_lo, p.eig_hi);
     }
 
-    f.omega[k] = 0.0f;
+    f.hpow[k] = 0.0f;
     f.wall_flux[k] = 0;
     if (f.wall_E) f.wall_E[k] = 0;
     if (f.s00_obs) { f.s00_obs[k]=f.s00[k]; f.s01_obs[k]=f.s01[k]; f.s11_obs[k]=f.s11[k]; }
@@ -204,6 +204,21 @@ __global__ void k_transport(GridFieldsPtrs f, SimParams p) {
     float s45p = 0.5f*(s0 + s2) + s1;
     float s45m = 0.5f*(s0 + s2) - s1;
 
+    // Local omega from radial profile: w(r) = omega_base * (r/wall_r)^omega_r_power
+    float w_local = 0.0f;
+    if (fabsf(p.omega_base) > 1e-8f) {
+        float rx = (p.Nx>1) ? (float)gi/(p.Nx-1) - 0.5f : 0.0f;
+        float ry = (p.Ny>1) ? (float)gj/(p.Ny-1) - 0.5f : 0.0f;
+        float r_norm = sqrtf(rx*rx + ry*ry) / fmaxf(p.wall_radius, 0.01f);
+        r_norm = fminf(r_norm, 1.0f);
+        float r_fac = (p.omega_r_power > 0.01f) ? powf(r_norm, p.omega_r_power) : 1.0f;
+        w_local = p.omega_base * r_fac;
+    }
+
+    // Gradient from shared memory (central differences) for drift term
+    float gradEx = 0.5f * (sE[R] - sE[L]);
+    float gradEy = 0.5f * (sE[U] - sE[D]);
+
     float dE_transport = 0.0f;
     float wf = 0.0f;
 
@@ -227,6 +242,7 @@ __global__ void k_transport(GridFieldsPtrs f, SimParams p) {
         unsigned int canon_dir = min((unsigned)dir, (unsigned)((dir + 4) & 7));
         unsigned int edge_key = min((unsigned)gk, (unsigned)nb_gk) * 8u + canon_dir;
 
+        // --- Diffusive MC (symmetric, from S) ---
         float flux;
         if (p_raw >= 1.0f) {
             flux = dE * 0.5f;
@@ -235,6 +251,23 @@ __global__ void k_transport(GridFieldsPtrs f, SimParams p) {
             float u2 = gpu_rand_uniform(p.seed, edge_key, step, 71u);
             flux = (u2 <= p_raw) ? u1 * dE : 0.0f;
         }
+
+        // --- Drift MC (antisymmetric, from Omega) ---
+        // flux_drift along d_hat = -w * (nabla_E . d_hat_perp) * dt
+        // dE_perp = (dj * gradEx - di * gradEy) measures perpendicular gradient
+        if (fabsf(w_local) > 1e-8f) {
+            float dE_perp = (float)dj * gradEx - (float)di * gradEy;
+            float p_drift = 2.0f * fabsf(w_local) * p.dt * dist_fac;
+            if (p_drift >= 1.0f) {
+                flux += dE_perp * 0.5f;
+            } else {
+                float v1 = gpu_rand_uniform(p.seed, edge_key, step, 80u);
+                float v2 = gpu_rand_uniform(p.seed, edge_key, step, 81u);
+                if (v2 <= p_drift)
+                    flux += v1 * dE_perp;
+            }
+        }
+
         dE_transport += flux;
 
         bool nb_valid = ni>=0 && ni<p.Nx && nj>=0 && nj<p.Ny;
@@ -294,7 +327,7 @@ __global__ void k_transport(GridFieldsPtrs f, SimParams p) {
 
     // Heater response: exponential smoothing
     float Qh_target = Qh;
-    float Qh_cur = f.omega[gk];
+    float Qh_cur = f.hpow[gk];
     float resp_tau = p.heater_response_tau;
     if (resp_tau > 1e-6f) {
         float a = fminf(p.dt / resp_tau, 1.0f);
@@ -302,7 +335,7 @@ __global__ void k_transport(GridFieldsPtrs f, SimParams p) {
     } else {
         Qh_cur = Qh_target;
     }
-    f.omega_buf[gk] = Qh_cur;
+    f.hpow_buf[gk] = Qh_cur;
     Qh = Qh_cur;
 
     float Qrad = 0;
@@ -359,7 +392,7 @@ __global__ void k_tensor(GridFieldsPtrs f, SimParams p) {
     int gk = cidx(gi,gj,p.Ny);
     if (f.is_wall[gk]) {
         f.s00_buf[gk]=1; f.s01_buf[gk]=0; f.s11_buf[gk]=1;
-        f.omega_buf[gk]=0;
+        f.hpow_buf[gk]=0;
         return;
     }
 

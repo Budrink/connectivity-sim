@@ -13,7 +13,7 @@ struct GridFieldsPtrs {
     float *s00_buf, *s01_buf, *s11_buf;
 
     // Heater current power (double-buffered, exponential smoothing)
-    float *omega, *omega_buf;
+    float *hpow, *hpow_buf;
 
     // Delayed S observation (exponential smoothing for event-driven heater)
     float *s00_obs, *s01_obs, *s11_obs;

@@ -449,6 +449,10 @@ int main(int argc, char** argv) {
             ImGui::SliderFloat("l0 (scale)", &pp.l0, 0.01f, 5.0f, "%.3f");
             ImGui::SliderFloat("alpha (power)", &pp.res_alpha, 0.0f, 2.0f, "%.2f");
 
+            ImGui::Separator(); ImGui::Text("Omega (drift / antisymmetric transport)");
+            ImGui::SliderFloat("omega_base", &pp.omega_base, -10.0f, 10.0f, "%.2f");
+            ImGui::SliderFloat("omega_r_pow", &pp.omega_r_power, 0.0f, 3.0f, "%.1f");
+
             ImGui::Separator(); ImGui::Text("Beta / Disruption");
             ImGui::SliderFloat("beta_limit", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
             ImGui::SliderFloat("wf_flux_lim", &dtrack.wf_flux_limit, 0.0f, 200.0f, "%.0f");

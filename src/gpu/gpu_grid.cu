@@ -26,7 +26,7 @@ void GpuGrid::alloc_all() {
     af(&fields_.E); af(&fields_.E_buf);
     af(&fields_.s00); af(&fields_.s01); af(&fields_.s11);
     af(&fields_.s00_buf); af(&fields_.s01_buf); af(&fields_.s11_buf);
-    af(&fields_.omega); af(&fields_.omega_buf);
+    af(&fields_.hpow); af(&fields_.hpow_buf);
     af(&fields_.s00_obs); af(&fields_.s01_obs); af(&fields_.s11_obs);
     af(&fields_.heat_profile);
     au(&fields_.is_wall);
@@ -53,7 +53,7 @@ void GpuGrid::free_all() {
     ff(fields_.E); ff(fields_.E_buf);
     ff(fields_.s00); ff(fields_.s01); ff(fields_.s11);
     ff(fields_.s00_buf); ff(fields_.s01_buf); ff(fields_.s11_buf);
-    ff(fields_.omega); ff(fields_.omega_buf);
+    ff(fields_.hpow); ff(fields_.hpow_buf);
     ff(fields_.s00_obs); ff(fields_.s01_obs); ff(fields_.s11_obs);
     ff(fields_.heat_profile);
     fu(fields_.is_wall);
@@ -202,7 +202,7 @@ void GpuGrid::swap_buffers() {
     std::swap(fields_.s00, fields_.s00_buf);
     std::swap(fields_.s01, fields_.s01_buf);
     std::swap(fields_.s11, fields_.s11_buf);
-    std::swap(fields_.omega, fields_.omega_buf);
+    std::swap(fields_.hpow, fields_.hpow_buf);
 }
 
 void GpuGrid::step() {
@@ -306,6 +306,9 @@ SimParams default_sim_params() {
     p.beta_limit = 150.0f;
 
 
+    p.omega_base = 0.0f;
+    p.omega_r_power = 0.0f;
+
     p.use_equilibrium = 0;
     p.chi_parallel = 4.0f;
     p.chi_perp = 0.25f;
@@ -375,6 +378,9 @@ SimParams load_sim_params(const std::string& path) {
 
     G("beta","limit",beta_limit);
 
+
+    G("omega","base",omega_base);
+    G("omega","r_power",omega_r_power);
 
     if (c["equilibrium"]) {
         auto eq = c["equilibrium"];

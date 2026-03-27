@@ -75,6 +75,10 @@ struct SimParams {
     float beta_limit;        // thermal quench if center_E > beta_limit (0 = off)
 
 
+    // --- External Omega (antisymmetric transport: drift perpendicular to grad E) ---
+    float omega_base;        // uniform Omega magnitude (signed: +CCW, -CW)
+    float omega_r_power;     // radial profile: w(r) = omega_base * (r/wall_r)^omega_r_power
+
     // --- Equilibrium (real tokamak geometry) ---
     int   use_equilibrium;
     float chi_parallel;
