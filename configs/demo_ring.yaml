@@ -1,0 +1,35 @@
+# Demo: Strong ring formation with event-driven heater
+# Event-driven feedback + observation delay + response time
+
+grid:
+  Nx: 256
+  Ny: 256
+
+radiation:
+  gamma_rad: 0.001
+  rad_exp: 1.5
+
+wall:
+  radius: 0.45
+  cooling: 0.5
+  E_max: 50.0
+
+tensor_S:
+  eig_lo: 0.5
+
+heater:
+  type: event_driven
+  power: 2.5
+  trigger: 0.8
+  cx: 0.5
+  cy: 0.5
+  rx: 0.20
+  ry: 0.20
+  peak: 1.0
+  response_tau: 0.8
+  obs_delay: 0.3
+
+g_response:
+  grad_kappa: 8.0
+  grad_tau: 0.3
+  grad_E_ref: 1.0

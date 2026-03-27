@@ -10,3 +10,7 @@ data/
 __pycache__/
 .vscode/
 .idea/
+.cursor/
+imgui.ini
+*.mp4
+*.mkv

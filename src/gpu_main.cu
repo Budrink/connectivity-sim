@@ -26,16 +26,11 @@ static ImU32 hot(float v) {
     float b = fminf(fmaxf((v-0.67f)*3.0f, 0.0f), 1.0f);
     return IM_COL32((int)(r*255),(int)(g*255),(int)(b*255),255);
 }
-// Disruption state machine.
-// Tracks three failure modes:
-//   1) WF spike:  wall_flux jumps > spike_ratio × EMA  (fast ELM crash)
-//   2) Low conf:  confinement < conf_collapse           (lost confinement)
-//   3) Degrading: confinement trend negative for N windows (slow leak)
+
 struct DisruptionTracker {
     bool   disruption_active = false;
     bool   hard_disruption = false;
     bool   degrading = false;
-    int    elm_count = 0;
     float  disruption_timer = 0;
 
     int    warmup_steps = 5000;
@@ -45,14 +40,13 @@ struct DisruptionTracker {
     float  wf_spike_ratio = 2.0f;
     float  wf_hard_ratio  = 4.0f;
     float  conf_collapse  = 1.5f;
-    float  wf_flux_limit  = 50.0f;   // absolute wall flux limit — disruption if exceeded
+    float  wf_flux_limit  = 50.0f;
 
-    // Trend detection: track confinement over sliding windows
     static constexpr int TREND_N = 8;
     float  conf_window[TREND_N] = {};
     int    conf_idx = 0;
     int    conf_filled = 0;
-    int    trend_sample_every = 200;  // steps between trend samples
+    int    trend_sample_every = 200;
     int    trend_counter = 0;
     float  conf_peak = 0;
 
@@ -60,14 +54,13 @@ struct DisruptionTracker {
 
     const SimParams* grid_params_ptr = nullptr;
     void update(const GlobalMetrics& m, float dt, int steps_done = 1) {
-        const SimParams& grid_params = *grid_params_ptr;
-        step_counter += steps_done;
+        const SimParams& gp = *grid_params_ptr;
+        step_counter = gp.step_count;
 
         float wf = m.total_wall_flux;
         if (wf_ema < 0) wf_ema = wf;
         else             wf_ema = 0.9f * wf_ema + 0.1f * wf;
 
-        // Absolute sanity checks — always active, even during warmup
         bool nan_blow = (m.center_E != m.center_E) || (m.total_E != m.total_E);
         bool overflow = (m.center_E > 1e6f) || (m.edge_E > 1e6f);
         if (nan_blow || overflow) {
@@ -84,7 +77,6 @@ struct DisruptionTracker {
 
         conf_peak = fmaxf(conf_peak, m.confinement);
 
-        // Sample confinement trend
         trend_counter += steps_done;
         if (trend_counter >= trend_sample_every) {
             trend_counter = 0;
@@ -93,7 +85,6 @@ struct DisruptionTracker {
             if (conf_filled < TREND_N) conf_filled++;
         }
 
-        // Check monotonic degradation: all recent windows declining
         degrading = false;
         if (conf_filled >= TREND_N) {
             int declining = 0;
@@ -106,37 +97,25 @@ struct DisruptionTracker {
         }
 
         bool spike = (wf > wf_ema * wf_spike_ratio) && (wf_ema > 0.1f);
-        bool collapsed = false;
-        bool lost_most = false;
         bool wall_contact = (m.edge_E > 0.3f * m.center_E) && (m.center_E > 0.05f);
-        float wE_max = grid_params.wall_E_max;
+        float wE_max = gp.wall_E_max;
         bool wall_melt = (wE_max > 0) && (m.max_wall_E > wE_max);
         bool wall_flux_overload = (wf_flux_limit > 0) && (wf > wf_flux_limit);
-        bool beta_exceeded = (grid_params.beta_limit > 0) &&
-                             (m.center_E > grid_params.beta_limit);
+        bool beta_exceeded = (gp.beta_limit > 0) && (m.center_E > gp.beta_limit);
 
         if (!disruption_active) {
             if (beta_exceeded) {
-                disruption_active = true;
-                hard_disruption = true;
+                disruption_active = true; hard_disruption = true;
                 status_text = "BETA LIMIT";
             } else if (wall_melt || wall_flux_overload) {
-                disruption_active = true;
-                hard_disruption = true;
+                disruption_active = true; hard_disruption = true;
                 status_text = wall_melt ? "WALL MELT" : "WALL FLUX OVERLOAD";
             } else if (wall_contact) {
-                disruption_active = true;
-                hard_disruption = true;
+                disruption_active = true; hard_disruption = true;
                 status_text = "WALL CONTACT";
             } else if (spike) {
-                disruption_active = true;
-                disruption_timer = 0;
-                elm_count++;
-                status_text = "ELM spike";
-            } else if (collapsed || lost_most) {
-                disruption_active = true;
-                hard_disruption = true;
-                status_text = collapsed ? "Collapsed" : "Lost confinement";
+                disruption_active = true; disruption_timer = 0;
+                status_text = "Wall flux spike";
             } else if (degrading) {
                 status_text = "DEGRADING";
             } else {
@@ -146,7 +125,8 @@ struct DisruptionTracker {
 
         if (disruption_active) {
             disruption_timer += dt;
-            if (wf > wf_ema * wf_hard_ratio || collapsed || lost_most || wall_contact || wall_melt || wall_flux_overload || beta_exceeded) {
+            if (wf > wf_ema * wf_hard_ratio || wall_contact || wall_melt ||
+                wall_flux_overload || beta_exceeded) {
                 hard_disruption = true;
             }
             if (!hard_disruption && wf < wf_ema * 1.2f && disruption_timer > 0.5f) {
@@ -156,28 +136,18 @@ struct DisruptionTracker {
     }
 
     void reset() {
-        disruption_active = false;
-        hard_disruption = false;
-        degrading = false;
-        elm_count = 0;
-        disruption_timer = 0;
-        step_counter = 0;
-        wf_ema = -1.0f;
-        conf_idx = 0;
-        conf_filled = 0;
-        trend_counter = 0;
-        conf_peak = 0;
-        status_text = "Warmup";
+        disruption_active = false; hard_disruption = false; degrading = false;
+        disruption_timer = 0; step_counter = 0;
+        wf_ema = -1.0f; conf_idx = 0; conf_filled = 0;
+        trend_counter = 0; conf_peak = 0; status_text = "Warmup";
     }
 };
 
-// Time series buffer (vector-based for ImPlot .data() compatibility)
 struct TimeSeries {
     std::vector<float> t, total_E, center_E, edge_E;
     std::vector<float> mean_aniso, barrier_aniso;
     std::vector<float> wall_flux, wall_T_peak, radiation;
-    std::vector<float> confinement, fusion_margin;
-    std::vector<float> mean_effort, mean_x_norm;
+    std::vector<float> confinement;
     int max_len;
     TimeSeries(int ml = 4000) : max_len(ml) {}
     void push(float time, const GlobalMetrics& m) {
@@ -196,9 +166,6 @@ struct TimeSeries {
         ap(wall_T_peak, m.max_wall_E);
         ap(radiation, m.total_radiation);
         ap(confinement, m.confinement);
-        ap(fusion_margin, m.fusion_margin);
-        ap(mean_effort, m.mean_effort);
-        ap(mean_x_norm, m.mean_x_norm);
     }
 };
 
@@ -259,7 +226,6 @@ static void draw_aniso_dir(const char* label, const float* aniso, const float* a
         float a = aniso[si*Ny+sj];
         float th = angle[si*Ny+sj];
         float mag = fminf(a / fmaxf(max_aniso, 0.01f), 1.0f);
-        // Hue: direction (angle [−π/2, π/2] → [0, 1])
         float hue = (th / 3.14159f) + 0.5f;
         if (hue < 0) hue += 1.0f; if (hue > 1.0f) hue -= 1.0f;
         ImU32 col = hsv_to_col(hue, 1.0f, mag);
@@ -267,7 +233,6 @@ static void draw_aniso_dir(const char* label, const float* aniso, const float* a
         dl->AddRectFilled(ImVec2(x0,y0), ImVec2(x0+cs+1,y0+cs+1), col);
     }
 
-    // Overlay direction ticks (subsampled)
     int tick_step = (int)fmaxf(mapW / 30.0f, 2.0f);
     for (int mi = tick_step/2; mi < mapW; mi += tick_step)
     for (int mj = tick_step/2; mj < mapH; mj += tick_step) {
@@ -304,7 +269,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    GLFWwindow* win = glfwCreateWindow(1920, 1080, "Aniso-Control GPU — MHD Disruption Sim", NULL, NULL);
+    GLFWwindow* win = glfwCreateWindow(1920, 1080, "Connectivity Transport Simulation", NULL, NULL);
     if (!win) { fprintf(stderr,"Window creation failed\n"); glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -319,7 +284,6 @@ int main(int argc, char** argv) {
     ImGuiIO& io = ImGui::GetIO();
     io.FontGlobalScale = 1.1f;
 
-    // Load params
     std::string cfg = (argc > 1) ? argv[1] : "";
     SimParams sp;
     if (!cfg.empty()) {
@@ -331,11 +295,9 @@ int main(int argc, char** argv) {
 
     aniso::gpu::GpuGrid grid;
 
-    // Try to load equilibrium data
     {
         std::string eq_path;
         if (!cfg.empty()) {
-            // Look for equilibrium.bin next to config file
             size_t slash = cfg.find_last_of("/\\");
             std::string dir = (slash != std::string::npos) ? cfg.substr(0, slash+1) : "";
             eq_path = dir + "equilibrium.bin";
@@ -361,7 +323,6 @@ int main(int argc, char** argv) {
     float map_size = 250.0f;
     int active_map = 0;
     float E_scale = 5.0f;
-    float effort_scale = 3.0f;
     float aniso_scale = 5.0f;
     float gradE_scale = 100.0f;
     bool auto_scale = true;
@@ -383,45 +344,6 @@ int main(int argc, char** argv) {
             ts.push(grid.t(), m);
             dtrack.update(m, grid.params().dt * steps_per_frame, steps_per_frame);
 
-            // Diagnostic: anisotropy and gradient range
-            if (frame_counter % (readback_every * 50) == 0) {
-                const float* ad = grid.h_aniso();
-                const float* ed = grid.h_E();
-                int N = grid.params().Nx;
-                int Ntot = N * N;
-                float amin = 1e9f, amax = -1e9f;
-                int cx = N/2, cy = N/2;
-                int ck = cx * N + cy;
-                float a_center = ad[ck];
-                float e_center = ed[ck];
-                // ring at offset ~N/8
-                int rx = cx + N/8;
-                int rk = rx * N + cy;
-                float a_ring = ad[rk];
-                float e_ring = ed[rk];
-                // compute gradient at ring point
-                float dE = 0;
-                if (rx > 0 && rx < N-1) {
-                    float el = ed[(rx-1)*N + cy];
-                    float er = ed[(rx+1)*N + cy];
-                    dE = 0.5f*(er - el);
-                }
-                float dx = 1.0f / (N - 1);
-                float gradEsq = (dE*dE)/(dx*dx);
-                for (int ii = 0; ii < Ntot; ii++) {
-                    if (ad[ii] >= 0) {
-                        amin = fminf(amin, ad[ii]);
-                        amax = fmaxf(amax, ad[ii]);
-                    }
-                }
-                fprintf(stderr, "[DIAG] step=%d aniso=[%.2f,%.2f] center=%.3f ring=%.3f | "
-                        "E center=%.2f ring=%.2f | gradEsq_ring=%.1f (crit=%.1f) g_resp=%d\n",
-                        (int)grid.params().step_count, amin, amax, a_center, a_ring,
-                        e_center, e_ring, gradEsq, grid.params().shear_crit,
-                        grid.params().g_response_type);
-            }
-
-            // Auto-pause on hard disruption (energy reached wall)
             if (dtrack.hard_disruption && !paused) {
                 paused = true;
             }
@@ -446,10 +368,9 @@ int main(int argc, char** argv) {
                          ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar);
 
             const auto& m = grid.metrics();
-            ImGui::Text("t=%.2f | step=%u | E_tot=%.1f | center=%.2f | edge=%.2f | confine=%.1f | ELMs=%d",
+            ImGui::Text("t=%.2f | step=%u | E_tot=%.1f | center=%.2f | edge=%.2f | confine=%.1f",
                         grid.t(), grid.params().step_count,
-                        m.total_E, m.center_E, m.edge_E, m.confinement,
-                        dtrack.elm_count);
+                        m.total_E, m.center_E, m.edge_E, m.confinement);
             ImGui::SameLine(ImGui::GetWindowWidth()-250);
 
             {
@@ -477,7 +398,7 @@ int main(int argc, char** argv) {
 
             if (ImGui::Button(paused ? "Resume" : "Pause")) {
                 if (paused && dtrack.hard_disruption)
-                    dtrack.hard_disruption = false; // user acknowledged, allow resume
+                    dtrack.hard_disruption = false;
                 paused = !paused;
             }
             ImGui::SameLine();
@@ -506,39 +427,33 @@ int main(int argc, char** argv) {
             }
             if (pp.heater_type == HEAT_EVENT_DRIVEN || pp.heater_type == HEAT_ANISO_AWARE) {
                 ImGui::SliderFloat("Trigger##heat", &pp.heater_trigger, 0.0f, 3.0f);
-                ImGui::SliderFloat("Obs delay##heat", &pp.ctrl_delay_tau, 0.0f, 5.0f, "%.3f");
-            }
-            if (pp.heater_type == HEAT_ANISO_AWARE) {
-                // no extra params beyond power
+                ImGui::SliderFloat("Obs delay##heat", &pp.heater_obs_delay, 0.0f, 5.0f, "%.3f");
             }
             if (pp.heater_type == HEAT_TARGET) {
                 ImGui::SliderFloat("E_target (heat)", &pp.heater_E_target, 0, 10.0f);
                 ImGui::SliderFloat("k_heat", &pp.heater_k_heat, 0, 10.0f);
             }
-            ImGui::SliderFloat("Response tau", &pp.visc_omega, 0.0f, 5.0f, "%.3f");
+            ImGui::SliderFloat("Response tau", &pp.heater_response_tau, 0.0f, 5.0f, "%.3f");
             ImGui::SliderFloat("Heat cx", &pp.heat_cx, 0.0f, 1.0f);
             ImGui::SliderFloat("Heat cy", &pp.heat_cy, 0.0f, 1.0f);
             ImGui::SliderFloat("Heat rx", &pp.heat_rx, 0.01f, 0.5f);
             ImGui::SliderFloat("Heat ry", &pp.heat_ry, 0.01f, 0.5f);
             ImGui::SliderFloat("Heat peak", &pp.heat_peak, 0.0f, 5.0f);
 
-            // Controller disabled until A-component is implemented
-
-            ImGui::Separator(); ImGui::Text("Tensor S  (S = E/E_ref · I + κ·∇E⊗∇E/E_ref²)");
+            ImGui::Separator(); ImGui::Text("Tensor S  (S = E/E_ref + kappa * grad E x grad E / E_ref^2)");
             ImGui::SliderFloat("kappa (aniso)", &pp.grad_kappa, 0.0f, 50.0f);
             ImGui::SliderFloat("tau (relax)", &pp.grad_tau, 0.01f, 5.0f, "%.3f");
             ImGui::SliderFloat("E_ref", &pp.grad_E_ref, 0.1f, 10.0f);
             ImGui::SliderFloat("eig_lo", &pp.eig_lo, 0.01f, 5.0f, "%.2f");
-            ImGui::SliderFloat("eig_hi", &pp.eig_hi, 1.0f, 100.0f, "%.1f");
+            ImGui::SliderFloat("eig_hi (cap)", &pp.eig_hi, 100.0f, 1e4f, "%.0f");
+            ImGui::SliderFloat("l0 (scale)", &pp.l0, 0.01f, 5.0f, "%.3f");
+            ImGui::SliderFloat("alpha (power)", &pp.res_alpha, 0.0f, 2.0f, "%.2f");
 
-            ImGui::Separator(); ImGui::Text("Disruption");
+            ImGui::Separator(); ImGui::Text("Beta / Disruption");
+            ImGui::SliderFloat("beta_limit", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
             ImGui::SliderFloat("wf_flux_lim", &dtrack.wf_flux_limit, 0.0f, 200.0f, "%.0f");
             ImGui::SliderFloat("spike_ratio", &dtrack.wf_spike_ratio, 1.5f, 10.0f, "%.1f");
             ImGui::SliderInt("warmup", &dtrack.warmup_steps, 0, 20000);
-
-            ImGui::Separator(); ImGui::Text("Observation");
-            ImGui::SliderFloat("l0", &pp.l0, 0.01f, 2.0f);
-            ImGui::SliderFloat("sigma_G", &pp.sigma_G, 0, 1.0f);
 
             if (grid.has_equilibrium()) {
                 ImGui::Separator(); ImGui::Text("Equilibrium");
@@ -551,7 +466,6 @@ int main(int argc, char** argv) {
                 if (pp.use_equilibrium) {
                     ImGui::SliderFloat("chi_parallel", &pp.chi_parallel, 0.5f, 20.0f);
                     ImGui::SliderFloat("chi_perp", &pp.chi_perp, 0.01f, 2.0f);
-                    ImGui::SliderFloat("q_elm_scale", &pp.q_elm_scale, 0.5f, 10.0f);
                     ImGui::Text("chi ratio: %.0f:1", pp.chi_parallel / fmaxf(pp.chi_perp, 0.001f));
                 }
             }
@@ -559,7 +473,6 @@ int main(int argc, char** argv) {
             ImGui::Separator();
             ImGui::Checkbox("Auto-scale", &auto_scale);
             if (!auto_scale) ImGui::SliderFloat("E_scale", &E_scale, 0.1f, 20.0f);
-            ImGui::SliderFloat("effort_scale", &effort_scale, 0.1f, 20.0f);
             ImGui::SliderFloat("aniso_scale", &aniso_scale, 0.1f, 20.0f);
             ImGui::SliderFloat("gradE_scale", &gradE_scale, 1.0f, 1000.0f);
 
@@ -576,9 +489,7 @@ int main(int argc, char** argv) {
 
             const float* edata = grid.h_E();
             const float* adata = grid.h_aniso();
-            const float* udata = grid.h_effort();
             const float* wdata = grid.h_wall_flux();
-            const float* fdata = grid.h_fisher_min();
             const float* pdata = grid.h_psi_norm();
             const float* gEdata = grid.h_gradE_sq();
 
@@ -595,15 +506,14 @@ int main(int argc, char** argv) {
             ImGui::EndGroup();
             ImGui::BeginGroup();
 
-            // Selectable map
-            const char* map4opts[] = {"Control effort", "Wall flux", "Fisher min"};
+            const char* map4opts[] = {"Wall flux", "Wall temperature"};
             ImGui::PushID("map4sel");
-            ImGui::Combo("##map4", &active_map, map4opts, 3);
+            ImGui::Combo("##map4", &active_map, map4opts, 2);
             ImGui::PopID();
             switch (active_map) {
-            case 0: draw_heatmap("Control effort", udata, Nx, Ny, viridis, 0, effort_scale, map_size); break;
-            case 1: draw_heatmap("Wall flux", wdata, Nx, Ny, hot, 0, 0.1f, map_size); break;
-            case 2: draw_heatmap("Fisher min", fdata, Nx, Ny, viridis, 0, 5.0f, map_size); break;
+            case 0: draw_heatmap("Wall flux", wdata, Nx, Ny, hot, 0, 0.1f, map_size); break;
+            case 1: draw_heatmap("Wall temperature", grid.h_wall_E(), Nx, Ny, hot, 0,
+                                  fmaxf(grid.params().wall_E_max, 1.0f), map_size); break;
             }
             ImGui::EndGroup();
 
@@ -651,12 +561,6 @@ int main(int argc, char** argv) {
                     ImPlot::EndPlot();
                 }
             }
-            if (ImGui::CollapsingHeader("Control Effort")) {
-                plot_series("##Effort", ts.t, ts.mean_effort, 100);
-            }
-            if (ImGui::CollapsingHeader("|x| norm")) {
-                plot_series("##Xnorm", ts.t, ts.mean_x_norm, 100);
-            }
 
             ImGui::Separator();
             const auto& m = grid.metrics();
@@ -670,8 +574,6 @@ int main(int argc, char** argv) {
             ImGui::BulletText("Wall T peak: %.2f / %.0f", m.max_wall_E, grid.params().wall_E_max);
             ImGui::BulletText("Wall T mean: %.3f", m.mean_wall_E);
             ImGui::BulletText("Radiation: %.3f", m.total_radiation);
-            ImGui::BulletText("Mean effort: %.4f", m.mean_effort);
-            ImGui::BulletText("ELM count: %d", dtrack.elm_count);
 
             ImGui::End();
         }
