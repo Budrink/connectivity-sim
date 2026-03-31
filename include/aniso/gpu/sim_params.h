@@ -12,11 +12,12 @@ enum HeaterType {
     HEAT_PULSED         = 1,
     HEAT_EVENT_DRIVEN   = 2,
     HEAT_ANISO_AWARE    = 3,
-    HEAT_TARGET         = 4
+    HEAT_TARGET         = 4,
+    HEAT_BEAM_ARRAY     = 5
 };
 
 struct SimParams {
-    int   Nx, Ny;
+    int   Nx, Ny, Nz;
     float dt;
 
     // --- S eigenvalue bounds ---
@@ -41,8 +42,8 @@ struct SimParams {
     float heater_obs_delay;
 
     // --- Heating spatial profile (Gaussian) ---
-    float heat_cx, heat_cy;
-    float heat_rx, heat_ry;
+    float heat_cx, heat_cy, heat_cz;
+    float heat_rx, heat_ry, heat_rz;
     float heat_peak;
 
     // --- S dynamics: S_nat = (E/E_ref)·I + κ·(∇E⊗∇E)/E_ref² ---
@@ -52,6 +53,8 @@ struct SimParams {
 
     // --- Wall ---
     float wall_radius;
+    float tube_length;       // physical z-extent (Nz cells span this)
+    int   wall_z_periodic;   // periodic boundary condition in z
 
     // --- Initial conditions ---
     float g_noise_init;
@@ -74,7 +77,6 @@ struct SimParams {
     // --- Disruption ---
     float beta_limit;        // thermal quench if center_E > beta_limit (0 = off)
 
-
     // --- External Omega (antisymmetric transport: drift perpendicular to grad E) ---
     float omega_base;        // uniform Omega magnitude (signed: +CCW, -CW)
     float omega_r_power;     // radial profile: w(r) = omega_base * (r/wall_r)^omega_r_power
@@ -83,6 +85,27 @@ struct SimParams {
     int   use_equilibrium;
     float chi_parallel;
     float chi_perp;
+
+    // --- Self-consistent B-field (Ohm + Ampere) ---
+    float V_loop;             // loop voltage driving current; Jz = V_loop * E^spitzer
+    float spitzer_exp;        // J_z ~ E^exp (1.5 = Spitzer conductivity)
+    float Bz_ext;             // external axial (toroidal) field magnitude
+    int   poisson_iters;      // SOR iterations per field update
+    int   field_update_every; // recompute B-field every N steps (0 = never)
+    float sor_omega;          // SOR over-relaxation factor (1.0–1.9)
+    float field_kappa;        // congruence field suppression strength
+    float beta_scale;         // β degradation: fk_local = fk / (1 + E/(B²·beta_scale))
+    float inv_aspect_ratio;   // ε = a/R₀; centrifugal drift v = ε·E/Bz outward (+x)
+
+    // --- Beam array heating (used when heater_type == HEAT_BEAM_ARRAY) ---
+    int   n_beams;            // number of heating beams
+    float beam_sigma_r;       // radial Gaussian width (normalized coords)
+    float beam_sigma_z;       // z Gaussian width (normalized coords)
+    float beam_power;         // power per beam
+    float beam_r0;            // radial placement from center (normalized, ~0.15)
+
+    // --- Absorption modulation (all heater types) ---
+    float heat_E_abs;         // Q *= 1/(1 + E/E_abs); 0 = disabled
 };
 
 #ifdef __cplusplus

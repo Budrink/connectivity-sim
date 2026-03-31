@@ -81,6 +81,15 @@ add_library(implot_lib STATIC
 target_include_directories(implot_lib PUBLIC ${implot_SOURCE_DIR})
 target_link_libraries(implot_lib PUBLIC imgui_lib)
 
+# --- GLM (header-only math for 3D rendering) ---
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG        0.9.9.8
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(glm)
+
 # ===========================================================================
 #  GPU targets
 # ===========================================================================
@@ -107,7 +116,7 @@ target_compile_options(aniso_gpu_core PRIVATE
 # --- GPU GUI executable ---
 find_package(OpenGL REQUIRED)
 add_executable(aniso_gpu src/gpu_main.cu)
-target_include_directories(aniso_gpu PRIVATE include)
+target_include_directories(aniso_gpu PRIVATE include ${glm_SOURCE_DIR})
 target_link_libraries(aniso_gpu PRIVATE
     aniso_gpu_core
     implot_lib
@@ -134,4 +143,16 @@ target_compile_options(aniso_sweep_gl PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -O3>
 )
 
-message(STATUS "GPU targets: aniso_gpu_core, aniso_gpu, aniso_sweep_gl")
+# --- 3D field parameter sweep ---
+add_executable(aniso_sweep_3d src/gpu_sweep_3d.cu)
+target_include_directories(aniso_sweep_3d PRIVATE include)
+target_link_libraries(aniso_sweep_3d PRIVATE aniso_gpu_core CUDA::cudart)
+set_target_properties(aniso_sweep_3d PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "89"
+)
+target_compile_options(aniso_sweep_3d PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -O3>
+)
+
+message(STATUS "GPU targets: aniso_gpu_core, aniso_gpu, aniso_sweep_gl, aniso_sweep_3d")

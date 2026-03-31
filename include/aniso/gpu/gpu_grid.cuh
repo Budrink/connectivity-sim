@@ -56,6 +56,7 @@ public:
 
     int Nx() const { return params_.Nx; }
     int Ny() const { return params_.Ny; }
+    int Nz() const { return params_.Nz; }
     int total() const { return total_; }
     float t() const { return params_.t; }
 

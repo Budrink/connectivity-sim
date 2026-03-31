@@ -1,5 +1,12 @@
 #include "aniso/gpu/gpu_grid.cuh"
+
+#define GL_GLEXT_PROTOTYPES
 #include <GLFW/glfw3.h>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
@@ -263,6 +270,331 @@ static void plot_series(const char* label, const std::vector<float>& t,
     }
 }
 
+// ============================================================
+//  Volumetric Renderer — ray marching through GL_TEXTURE_3D
+// ============================================================
+
+static const char* g_vol_vert_src = R"glsl(
+#version 330 core
+out vec2 vUV;
+void main() {
+    vUV = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(vUV * 2.0 - 1.0, 0.0, 1.0);
+}
+)glsl";
+
+static const char* g_vol_frag_src = R"glsl(
+#version 330 core
+in vec2 vUV;
+out vec4 fragColor;
+
+uniform mat4 uMVPInv;
+uniform vec3 uCamPos;
+uniform sampler3D uVolTex;
+uniform sampler1D uTFTex;
+uniform float uOpacity;
+uniform float uLo;
+uniform float uHi;
+uniform float uStepSize;
+uniform vec3 uBoxMin;
+uniform vec3 uBoxMax;
+uniform float uWallRadius;
+uniform float uWallAlpha;
+
+vec2 intersect_box(vec3 orig, vec3 dir, vec3 bmin, vec3 bmax) {
+    vec3 inv_dir = 1.0 / dir;
+    vec3 t0 = (bmin - orig) * inv_dir;
+    vec3 t1 = (bmax - orig) * inv_dir;
+    vec3 tmin_v = min(t0, t1);
+    vec3 tmax_v = max(t0, t1);
+    float tnear = max(max(tmin_v.x, tmin_v.y), tmin_v.z);
+    float tfar  = min(min(tmax_v.x, tmax_v.y), tmax_v.z);
+    return vec2(tnear, tfar);
+}
+
+void main() {
+    vec2 ndc = vUV * 2.0 - 1.0;
+    vec4 near4 = uMVPInv * vec4(ndc, -1.0, 1.0);
+    vec4 far4  = uMVPInv * vec4(ndc,  1.0, 1.0);
+    vec3 nearP = near4.xyz / near4.w;
+    vec3 farP  = far4.xyz  / far4.w;
+    vec3 rayDir  = normalize(farP - nearP);
+    vec3 rayOrig = uCamPos;
+
+    vec2 t = intersect_box(rayOrig, rayDir, uBoxMin, uBoxMax);
+    t.x = max(t.x, 0.0);
+    if (t.x >= t.y) { fragColor = vec4(0.0); return; }
+
+    vec3  boxSize   = uBoxMax - uBoxMin;
+    float range_inv = 1.0 / max(uHi - uLo, 1e-8);
+    vec4  acc = vec4(0.0);
+
+    for (float d = t.x; d < t.y; d += uStepSize) {
+        vec3 p  = rayOrig + rayDir * d;
+        vec3 tc = (p - uBoxMin) / boxSize;
+
+        // Tube wall: cylindrical shell at wall_radius from center (0.5, 0.5)
+        if (uWallRadius > 0.0 && uWallAlpha > 0.0) {
+            float wx = tc.x - 0.5;
+            float wy = tc.y - 0.5;
+            float r = sqrt(wx*wx + wy*wy);
+            float dr = abs(r - uWallRadius);
+            if (dr < 0.015) {
+                float wall_a = uWallAlpha * (1.0 - dr / 0.015) * uStepSize * 30.0;
+                vec3 wall_col = vec3(0.3, 0.5, 0.7);
+                acc.rgb += (1.0 - acc.a) * wall_a * wall_col;
+                acc.a   += (1.0 - acc.a) * wall_a;
+            }
+        }
+
+        float val = texture(uVolTex, tc).r;
+        float nv  = clamp((val - uLo) * range_inv, 0.0, 1.0);
+        vec4  c   = texture(uTFTex, nv);
+        float a   = c.a * uOpacity * uStepSize * 50.0;
+        acc.rgb += (1.0 - acc.a) * a * c.rgb;
+        acc.a   += (1.0 - acc.a) * a;
+        if (acc.a > 0.95) break;
+    }
+    fragColor = vec4(acc.rgb, 1.0);
+}
+)glsl";
+
+struct OrbitCamera {
+    float theta    = 0.8f;
+    float phi      = 0.3f;
+    float distance = 2.5f;
+
+    glm::vec3 eye(glm::vec3 center) const {
+        float cp = cosf(phi);
+        return center + distance * glm::vec3(cp*sinf(theta), sinf(phi), cp*cosf(theta));
+    }
+    glm::mat4 view(glm::vec3 center) const {
+        return glm::lookAt(eye(center), center, glm::vec3(0,1,0));
+    }
+    glm::mat4 proj(float aspect) const {
+        return glm::perspective(glm::radians(45.0f), aspect, 0.01f, 100.0f);
+    }
+};
+
+struct VolumeRenderer {
+    GLuint prog = 0, vao = 0;
+    GLuint vol_tex = 0, tf_tex = 0;
+    GLuint fbo = 0, fbo_col = 0, fbo_dep = 0;
+    int fbo_w = 0, fbo_h = 0;
+    int vnx = 0, vny = 0, vnz = 0;
+    std::vector<float> staging;
+
+    GLint u_mvp_inv = -1, u_cam_pos = -1, u_vol_tex = -1, u_tf_tex = -1;
+    GLint u_opacity = -1, u_lo = -1, u_hi = -1, u_step = -1;
+    GLint u_box_min = -1, u_box_max = -1;
+    GLint u_wall_radius = -1, u_wall_alpha = -1;
+
+    static GLuint compile_gl(GLenum type, const char* src) {
+        GLuint s = glCreateShader(type);
+        glShaderSource(s, 1, &src, nullptr);
+        glCompileShader(s);
+        int ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+        if (!ok) { char log[1024]; glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+                    fprintf(stderr, "Shader error:\n%s\n", log); }
+        return s;
+    }
+
+    bool init() {
+        GLuint vs = compile_gl(GL_VERTEX_SHADER, g_vol_vert_src);
+        GLuint fs = compile_gl(GL_FRAGMENT_SHADER, g_vol_frag_src);
+        prog = glCreateProgram();
+        glAttachShader(prog, vs); glAttachShader(prog, fs);
+        glLinkProgram(prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        int ok; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) { char log[1024]; glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+                    fprintf(stderr, "Program link error:\n%s\n", log); return false; }
+
+        u_mvp_inv = glGetUniformLocation(prog, "uMVPInv");
+        u_cam_pos = glGetUniformLocation(prog, "uCamPos");
+        u_vol_tex = glGetUniformLocation(prog, "uVolTex");
+        u_tf_tex  = glGetUniformLocation(prog, "uTFTex");
+        u_opacity = glGetUniformLocation(prog, "uOpacity");
+        u_lo      = glGetUniformLocation(prog, "uLo");
+        u_hi      = glGetUniformLocation(prog, "uHi");
+        u_step    = glGetUniformLocation(prog, "uStepSize");
+        u_box_min = glGetUniformLocation(prog, "uBoxMin");
+        u_box_max = glGetUniformLocation(prog, "uBoxMax");
+        u_wall_radius = glGetUniformLocation(prog, "uWallRadius");
+        u_wall_alpha  = glGetUniformLocation(prog, "uWallAlpha");
+
+        glGenVertexArrays(1, &vao);
+        build_tf();
+        return true;
+    }
+
+    void build_tf() {
+        if (tf_tex) glDeleteTextures(1, &tf_tex);
+        glGenTextures(1, &tf_tex);
+        glBindTexture(GL_TEXTURE_1D, tf_tex);
+        unsigned char tf[256 * 4];
+        for (int i = 0; i < 256; i++) {
+            float v = i / 255.0f;
+            float r = fminf(fmaxf(-0.67f+4.65f*v-6.2f*v*v+3.22f*v*v*v, 0.0f), 1.0f);
+            float g = fminf(fmaxf(0.01f+1.3f*v-0.76f*v*v, 0.0f), 1.0f);
+            float b = fminf(fmaxf(0.34f+0.87f*v-2.4f*v*v+1.6f*v*v*v, 0.0f), 1.0f);
+            float a = v * v;
+            tf[i*4+0] = (unsigned char)(r*255);
+            tf[i*4+1] = (unsigned char)(g*255);
+            tf[i*4+2] = (unsigned char)(b*255);
+            tf[i*4+3] = (unsigned char)(a*255);
+        }
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA8, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, tf);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    }
+
+    void ensure_fbo(int w, int h) {
+        if (fbo && fbo_w == w && fbo_h == h) return;
+        if (fbo) { glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &fbo_col);
+                    glDeleteRenderbuffers(1, &fbo_dep); fbo = 0; }
+        fbo_w = w; fbo_h = h;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glGenTextures(1, &fbo_col);
+        glBindTexture(GL_TEXTURE_2D, fbo_col);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo_col, 0);
+        glGenRenderbuffers(1, &fbo_dep);
+        glBindRenderbuffer(GL_RENDERBUFFER, fbo_dep);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fbo_dep);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    void update_volume(const float* data, int nx, int ny, int nz, int display_nz = 0) {
+        int dnz = (display_nz > 0) ? display_nz : nz;
+        int n = nx * ny * dnz;
+        staging.resize(n);
+
+        for (int i = 0; i < nx; i++)
+            for (int j = 0; j < ny; j++)
+                for (int dk = 0; dk < dnz; dk++) {
+                    int sk = (nz > 1) ? (dk * nz / dnz) : 0;
+                    staging[(dk * ny + j) * nx + i] = data[(i * ny + j) * nz + sk];
+                }
+
+        bool need_resize = (!vol_tex || nx != vnx || ny != vny || dnz != vnz);
+        vnx = nx; vny = ny; vnz = dnz;
+        if (need_resize) {
+            if (vol_tex) glDeleteTextures(1, &vol_tex);
+            glGenTextures(1, &vol_tex);
+            glBindTexture(GL_TEXTURE_3D, vol_tex);
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, nx, ny, dnz, 0,
+                         GL_RED, GL_FLOAT, staging.data());
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+        } else {
+            glBindTexture(GL_TEXTURE_3D, vol_tex);
+            glTexSubImage3D(GL_TEXTURE_3D, 0, 0,0,0, nx, ny, dnz,
+                            GL_RED, GL_FLOAT, staging.data());
+        }
+    }
+
+    GLuint render(int w, int h, const OrbitCamera& cam, float opacity, float lo, float hi,
+                  float wall_radius = 0.45f, float wall_alpha = 0.3f) {
+        if (!vol_tex || !prog) return 0;
+        ensure_fbo(w, h);
+
+        glm::vec3 box_min(0.0f);
+        glm::vec3 box_max(1.0f);
+        glm::vec3 center = (box_min + box_max) * 0.5f;
+
+        float aspect = (float)w / (float)h;
+        glm::mat4 V = cam.view(center);
+        glm::mat4 P = cam.proj(aspect);
+        glm::mat4 mvp = P * V;
+        glm::mat4 mvp_inv = glm::inverse(mvp);
+        glm::vec3 eye = cam.eye(center);
+
+        float step_sz = 1.732f / (float)(std::max({vnx, vny, vnz}) * 2);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, w, h);
+        glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glUseProgram(prog);
+        glUniformMatrix4fv(u_mvp_inv, 1, GL_FALSE, glm::value_ptr(mvp_inv));
+        glUniform3fv(u_cam_pos, 1, glm::value_ptr(eye));
+        glUniform3fv(u_box_min, 1, glm::value_ptr(box_min));
+        glUniform3fv(u_box_max, 1, glm::value_ptr(box_max));
+        glUniform1f(u_opacity, opacity);
+        glUniform1f(u_lo, lo);
+        glUniform1f(u_hi, hi);
+        glUniform1f(u_step, step_sz);
+        glUniform1f(u_wall_radius, wall_radius);
+        glUniform1f(u_wall_alpha, wall_alpha);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_3D, vol_tex);
+        glUniform1i(u_vol_tex, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_1D, tf_tex);
+        glUniform1i(u_tf_tex, 1);
+
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+
+        glUseProgram(0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return fbo_col;
+    }
+
+    void destroy() {
+        if (prog)    { glDeleteProgram(prog);              prog = 0; }
+        if (vao)     { glDeleteVertexArrays(1, &vao);      vao = 0; }
+        if (vol_tex) { glDeleteTextures(1, &vol_tex);      vol_tex = 0; }
+        if (tf_tex)  { glDeleteTextures(1, &tf_tex);       tf_tex = 0; }
+        if (fbo)     { glDeleteFramebuffers(1, &fbo);      fbo = 0; }
+        if (fbo_col) { glDeleteTextures(1, &fbo_col);      fbo_col = 0; }
+        if (fbo_dep) { glDeleteRenderbuffers(1, &fbo_dep);  fbo_dep = 0; }
+    }
+};
+
+// ============================================================
+//  2D Slice View (z-slice from 3D readback)
+// ============================================================
+static void draw_heatmap_slice(const char* label, const float* data,
+                               int Nx, int Ny, int Nz, int z_slice,
+                               ImU32 (*cmap)(float), float lo, float hi, float sz) {
+    ImGui::BeginChild(label, ImVec2(sz+20, sz+30), true);
+    ImGui::Text("%s  z=%d/%d", label, z_slice, Nz);
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+
+    int step = 1;
+    int mapW = Nx, mapH = Ny;
+    if (Nx > 512) { step = (Nx + 511) / 512; mapW = Nx / step; mapH = Ny / step; }
+
+    float cs = sz / fmaxf(mapW, mapH);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float range = fmaxf(hi - lo, 1e-8f);
+    int zk = std::max(0, std::min(z_slice, Nz - 1));
+
+    for (int mi = 0; mi < mapW; ++mi)
+    for (int mj = 0; mj < mapH; ++mj) {
+        int si = mi*step, sj = mj*step;
+        float v = (data[(si * Ny + sj) * Nz + zk] - lo) / range;
+        ImU32 col = cmap(v);
+        float x0 = p0.x + mi*cs, y0 = p0.y + mj*cs;
+        dl->AddRectFilled(ImVec2(x0,y0), ImVec2(x0+cs+1,y0+cs+1), col);
+    }
+    ImGui::Dummy(ImVec2(sz, sz));
+    ImGui::EndChild();
+}
+
 int main(int argc, char** argv) {
     if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
 
@@ -283,6 +615,10 @@ int main(int argc, char** argv) {
 
     ImGuiIO& io = ImGui::GetIO();
     io.FontGlobalScale = 1.1f;
+
+    VolumeRenderer vol_renderer;
+    if (!vol_renderer.init())
+        fprintf(stderr, "Volume renderer init failed (non-fatal)\n");
 
     std::string cfg = (argc > 1) ? argv[1] : "";
     SimParams sp;
@@ -310,7 +646,7 @@ int main(int argc, char** argv) {
     }
 
     grid.init(sp);
-    int Nx = grid.Nx(), Ny = grid.Ny();
+    int Nx = grid.Nx(), Ny = grid.Ny(), Nz = grid.Nz();
 
     TimeSeries ts(4000);
     DisruptionTracker dtrack;
@@ -326,6 +662,15 @@ int main(int argc, char** argv) {
     float aniso_scale = 5.0f;
     float gradE_scale = 100.0f;
     bool auto_scale = true;
+
+    OrbitCamera orbit_cam;
+    float vol_opacity = 1.5f;
+    float vol_E_max = 10.0f;
+    bool  vol_use_map_E_scale = false;
+    float wall_tube_alpha = 0.3f;
+    bool  show_3d = true;
+    int   z_slice = 0;
+    int   vol_display_nz = 32;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -353,6 +698,10 @@ int main(int argc, char** argv) {
                                                ts.total_E.end());
                 E_scale = fmaxf(maxE / std::max(m.n_interior,1) * 3.0f, 0.5f);
             }
+
+            if (show_3d)
+                vol_renderer.update_volume(grid.h_E(), Nx, Ny, Nz,
+                                           (Nz == 1) ? vol_display_nz : 0);
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -418,27 +767,40 @@ int main(int argc, char** argv) {
             ImGui::SliderFloat("wall_Emax", &pp.wall_E_max, 1.0f, 500.0f, "%.0f");
 
             ImGui::Separator(); ImGui::Text("Heater");
-            ImGui::SliderFloat("Power", &pp.heater_power, 0, 50.0f);
-            const char* htypes[] = {"constant","pulsed","event_driven","aniso_aware","target"};
-            ImGui::Combo("Heater", &pp.heater_type, htypes, 5);
-            if (pp.heater_type == HEAT_PULSED) {
-                ImGui::SliderFloat("Period##heat", &pp.heater_period, 0.1f, 20.0f);
-                ImGui::SliderFloat("Duty##heat", &pp.heater_duty, 0.0f, 1.0f);
-            }
-            if (pp.heater_type == HEAT_EVENT_DRIVEN || pp.heater_type == HEAT_ANISO_AWARE) {
-                ImGui::SliderFloat("Trigger##heat", &pp.heater_trigger, 0.0f, 3.0f);
-                ImGui::SliderFloat("Obs delay##heat", &pp.heater_obs_delay, 0.0f, 5.0f, "%.3f");
-            }
-            if (pp.heater_type == HEAT_TARGET) {
-                ImGui::SliderFloat("E_target (heat)", &pp.heater_E_target, 0, 10.0f);
-                ImGui::SliderFloat("k_heat", &pp.heater_k_heat, 0, 10.0f);
+            const char* htypes[] = {"constant","pulsed","event_driven","aniso_aware","target","beam_array"};
+            ImGui::Combo("Heater", &pp.heater_type, htypes, 6);
+            if (pp.heater_type == HEAT_BEAM_ARRAY) {
+                ImGui::SliderInt("n_beams", &pp.n_beams, 1, 48);
+                ImGui::SliderFloat("beam_power", &pp.beam_power, 1.0f, 5000.0f, "%.0f");
+                ImGui::SliderFloat("beam_sigma_r", &pp.beam_sigma_r, 0.01f, 0.15f, "%.3f");
+                ImGui::SliderFloat("beam_sigma_z", &pp.beam_sigma_z, 0.01f, 0.2f, "%.3f");
+                ImGui::SliderFloat("beam_r0", &pp.beam_r0, 0.0f, 0.4f, "%.3f");
+            } else {
+                ImGui::SliderFloat("Power", &pp.heater_power, 0, 50.0f);
+                if (pp.heater_type == HEAT_PULSED) {
+                    ImGui::SliderFloat("Period##heat", &pp.heater_period, 0.1f, 20.0f);
+                    ImGui::SliderFloat("Duty##heat", &pp.heater_duty, 0.0f, 1.0f);
+                }
+                if (pp.heater_type == HEAT_EVENT_DRIVEN || pp.heater_type == HEAT_ANISO_AWARE) {
+                    ImGui::SliderFloat("Trigger##heat", &pp.heater_trigger, 0.0f, 3.0f);
+                    ImGui::SliderFloat("Obs delay##heat", &pp.heater_obs_delay, 0.0f, 5.0f, "%.3f");
+                }
+                if (pp.heater_type == HEAT_TARGET) {
+                    ImGui::SliderFloat("E_target (heat)", &pp.heater_E_target, 0, 10.0f);
+                    ImGui::SliderFloat("k_heat", &pp.heater_k_heat, 0, 10.0f);
+                }
+                ImGui::SliderFloat("Heat cx", &pp.heat_cx, 0.0f, 1.0f);
+                ImGui::SliderFloat("Heat cy", &pp.heat_cy, 0.0f, 1.0f);
+                ImGui::SliderFloat("Heat cz", &pp.heat_cz, 0.0f, 1.0f);
+                ImGui::SliderFloat("Heat rx", &pp.heat_rx, 0.01f, 0.5f);
+                ImGui::SliderFloat("Heat ry", &pp.heat_ry, 0.01f, 0.5f);
+                ImGui::SliderFloat("Heat rz", &pp.heat_rz, 0.01f, 0.5f);
+                ImGui::SliderFloat("Heat peak", &pp.heat_peak, 0.0f, 5.0f);
             }
             ImGui::SliderFloat("Response tau", &pp.heater_response_tau, 0.0f, 5.0f, "%.3f");
-            ImGui::SliderFloat("Heat cx", &pp.heat_cx, 0.0f, 1.0f);
-            ImGui::SliderFloat("Heat cy", &pp.heat_cy, 0.0f, 1.0f);
-            ImGui::SliderFloat("Heat rx", &pp.heat_rx, 0.01f, 0.5f);
-            ImGui::SliderFloat("Heat ry", &pp.heat_ry, 0.01f, 0.5f);
-            ImGui::SliderFloat("Heat peak", &pp.heat_peak, 0.0f, 5.0f);
+            ImGui::SliderFloat("Absorption E_abs", &pp.heat_E_abs, 0.0f, 50.0f, "%.1f");
+            if (pp.heat_E_abs > 0.0f)
+                ImGui::Text("  Q factor at E=1: %.2f", 1.0f/(1.0f + 1.0f/pp.heat_E_abs));
 
             ImGui::Separator(); ImGui::Text("Tensor S  (S = E/E_ref + kappa * grad E x grad E / E_ref^2)");
             ImGui::SliderFloat("kappa (aniso)", &pp.grad_kappa, 0.0f, 50.0f);
@@ -449,9 +811,21 @@ int main(int argc, char** argv) {
             ImGui::SliderFloat("l0 (scale)", &pp.l0, 0.01f, 5.0f, "%.3f");
             ImGui::SliderFloat("alpha (power)", &pp.res_alpha, 0.0f, 2.0f, "%.2f");
 
-            ImGui::Separator(); ImGui::Text("Omega (drift / antisymmetric transport)");
-            ImGui::SliderFloat("omega_base", &pp.omega_base, -10.0f, 10.0f, "%.2f");
-            ImGui::SliderFloat("omega_r_pow", &pp.omega_r_power, 0.0f, 3.0f, "%.1f");
+            if (pp.Nz > 1) {
+                ImGui::Separator(); ImGui::Text("Self-consistent B-field");
+                ImGui::SliderInt("field update N", &pp.field_update_every, 0, 100);
+                if (pp.field_update_every > 0) {
+                    ImGui::SliderFloat("V_loop", &pp.V_loop, 0.0f, 1.0f, "%.4f");
+                    ImGui::SliderFloat("Bz_ext", &pp.Bz_ext, 0.0f, 50.0f, "%.2f");
+                    ImGui::SliderFloat("spitzer_exp", &pp.spitzer_exp, 0.5f, 3.0f, "%.1f");
+                    ImGui::SliderFloat("field_kappa", &pp.field_kappa, 0.0f, 50.0f, "%.1f");
+                    ImGui::SliderFloat("beta_scale", &pp.beta_scale, 0.1f, 100.0f, "%.1f");
+                    ImGui::SliderFloat("inv_aspect (a/R0)", &pp.inv_aspect_ratio, 0.0f, 10.0f, "%.2f");
+                    ImGui::SliderInt("SOR iters", &pp.poisson_iters, 5, 2000);
+                    ImGui::SliderFloat("SOR omega", &pp.sor_omega, 1.0f, 1.95f, "%.2f");
+                    ImGui::Text("Ip (emergent): %.3f", grid.metrics().Ip_total / fmaxf((float)pp.Nz, 1.0f));
+                }
+            }
 
             ImGui::Separator(); ImGui::Text("Beta / Disruption");
             ImGui::SliderFloat("beta_limit", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
@@ -467,11 +841,18 @@ int main(int argc, char** argv) {
                     grid.reset();
                     ts = TimeSeries(4000); dtrack.reset();
                 }
-                if (pp.use_equilibrium) {
-                    ImGui::SliderFloat("chi_parallel", &pp.chi_parallel, 0.5f, 20.0f);
-                    ImGui::SliderFloat("chi_perp", &pp.chi_perp, 0.01f, 2.0f);
-                    ImGui::Text("chi ratio: %.0f:1", pp.chi_parallel / fmaxf(pp.chi_perp, 0.001f));
-                }
+                
+            }
+
+            ImGui::Separator(); ImGui::Text("3D Volume");
+            ImGui::Checkbox("Show 3D", &show_3d);
+            if (show_3d) {
+                ImGui::SliderFloat("Vol opacity", &vol_opacity, 0.1f, 5.0f, "%.1f");
+                ImGui::Checkbox("3D use 2D E_scale", &vol_use_map_E_scale);
+                if (!vol_use_map_E_scale)
+                    ImGui::SliderFloat("Vol E max", &vol_E_max, 0.5f, 200.0f, "%.1f");
+                ImGui::SliderFloat("Tube wall", &wall_tube_alpha, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderInt("Vol depth", &vol_display_nz, 1, 64);
             }
 
             ImGui::Separator();
@@ -483,43 +864,102 @@ int main(int argc, char** argv) {
             ImGui::End();
         }
 
-        // ===== Heatmaps =====
+        // ===== Field Maps =====
         {
             float mapx = 305;
             int maps_per_row = 3;
             ImGui::SetNextWindowPos(ImVec2(mapx, 40));
-            ImGui::SetNextWindowSize(ImVec2(map_size*maps_per_row+60, map_size*2+80));
+            ImGui::SetNextWindowSize(ImVec2(map_size*maps_per_row+60, map_size*2+100));
             ImGui::Begin("Field Maps", nullptr, ImGuiWindowFlags_NoResize);
 
-            const float* edata = grid.h_E();
-            const float* adata = grid.h_aniso();
-            const float* wdata = grid.h_wall_flux();
-            const float* pdata = grid.h_psi_norm();
-            const float* gEdata = grid.h_gradE_sq();
+            if (ImGui::BeginTabBar("FieldTabs")) {
+                if (ImGui::BeginTabItem("2D Maps")) {
+                    if (Nz > 1)
+                        ImGui::SliderInt("Z slice", &z_slice, 0, Nz - 1);
 
-            ImGui::BeginGroup();
-            if (grid.params().use_equilibrium) {
-                draw_heatmap("psi_norm", pdata, Nx, Ny, viridis, 0, 1.2f, map_size);
-                ImGui::SameLine();
-            }
-            draw_heatmap("Energy (E)", edata, Nx, Ny, hot, 0, E_scale, map_size);
-            ImGui::SameLine();
-            draw_aniso_dir("Anisotropy", adata, grid.h_aniso_angle(), Nx, Ny, aniso_scale, map_size);
-            ImGui::SameLine();
-            draw_heatmap("|grad E|^2", gEdata, Nx, Ny, hot, 0, gradE_scale, map_size);
-            ImGui::EndGroup();
-            ImGui::BeginGroup();
+                    const float* edata = grid.h_E();
+                    const float* adata = grid.h_aniso();
+                    const float* wdata = grid.h_wall_flux();
+                    const float* pdata = grid.h_psi_norm();
+                    const float* gEdata = grid.h_gradE_sq();
 
-            const char* map4opts[] = {"Wall flux", "Wall temperature"};
-            ImGui::PushID("map4sel");
-            ImGui::Combo("##map4", &active_map, map4opts, 2);
-            ImGui::PopID();
-            switch (active_map) {
-            case 0: draw_heatmap("Wall flux", wdata, Nx, Ny, hot, 0, 0.1f, map_size); break;
-            case 1: draw_heatmap("Wall temperature", grid.h_wall_E(), Nx, Ny, hot, 0,
-                                  fmaxf(grid.params().wall_E_max, 1.0f), map_size); break;
+                    if (Nz <= 1) {
+                        ImGui::BeginGroup();
+                        if (grid.params().use_equilibrium) {
+                            draw_heatmap("psi_norm", pdata, Nx, Ny, viridis, 0, 1.2f, map_size);
+                            ImGui::SameLine();
+                        }
+                        draw_heatmap("Energy (E)", edata, Nx, Ny, hot, 0, E_scale, map_size);
+                        ImGui::SameLine();
+                        draw_aniso_dir("Anisotropy", adata, grid.h_aniso_angle(), Nx, Ny, aniso_scale, map_size);
+                        ImGui::SameLine();
+                        draw_heatmap("|grad E|^2", gEdata, Nx, Ny, hot, 0, gradE_scale, map_size);
+                        ImGui::EndGroup();
+                    } else {
+                        const float* wedata = grid.h_wall_E();
+                        ImGui::BeginGroup();
+                        draw_heatmap_slice("Energy (E)", edata, Nx, Ny, Nz, z_slice, hot, 0, E_scale, map_size);
+                        ImGui::SameLine();
+                        draw_heatmap_slice("Wall T", wedata, Nx, Ny, Nz, z_slice, hot, 0,
+                                          fmaxf(grid.params().wall_E_max, 1.0f), map_size);
+                        ImGui::SameLine();
+                        draw_heatmap_slice("|grad E|^2", gEdata, Nx, Ny, Nz, z_slice, hot, 0, gradE_scale, map_size);
+                        ImGui::EndGroup();
+                    }
+
+                    ImGui::BeginGroup();
+                    const char* map4opts[] = {"Wall flux", "Wall temperature"};
+                    ImGui::PushID("map4sel");
+                    ImGui::Combo("##map4", &active_map, map4opts, 2);
+                    ImGui::PopID();
+                    if (Nz <= 1) {
+                        switch (active_map) {
+                        case 0: draw_heatmap("Wall flux", wdata, Nx, Ny, hot, 0, 0.1f, map_size); break;
+                        case 1: draw_heatmap("Wall temperature", grid.h_wall_E(), Nx, Ny, hot, 0,
+                                              fmaxf(grid.params().wall_E_max, 1.0f), map_size); break;
+                        }
+                    } else {
+                        switch (active_map) {
+                        case 0: draw_heatmap_slice("Wall flux", wdata, Nx, Ny, Nz, z_slice, hot, 0, 0.1f, map_size); break;
+                        case 1: draw_heatmap_slice("Wall temperature", grid.h_wall_E(), Nx, Ny, Nz, z_slice, hot, 0,
+                                              fmaxf(grid.params().wall_E_max, 1.0f), map_size); break;
+                        }
+                    }
+                    ImGui::EndGroup();
+
+                    ImGui::EndTabItem();
+                }
+
+                if (show_3d && ImGui::BeginTabItem("3D Volume")) {
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    int vw = std::max((int)avail.x - 10, 64);
+                    int vh = std::max((int)avail.y - 10, 64);
+
+                    float vol_hi = vol_use_map_E_scale ? E_scale : vol_E_max;
+                    GLuint vtex = vol_renderer.render(vw, vh, orbit_cam,
+                                                      vol_opacity, 0.0f, vol_hi,
+                                                      grid.params().wall_radius, wall_tube_alpha);
+                    if (vtex) {
+                        ImGui::Image((ImTextureID)(intptr_t)vtex,
+                                     ImVec2((float)vw, (float)vh),
+                                     ImVec2(0,1), ImVec2(1,0));
+                        if (ImGui::IsItemHovered()) {
+                            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                                ImVec2 d = io.MouseDelta;
+                                orbit_cam.theta -= d.x * 0.01f;
+                                orbit_cam.phi   += d.y * 0.01f;
+                                orbit_cam.phi = fmaxf(-1.5f, fminf(1.5f, orbit_cam.phi));
+                            }
+                            if (io.MouseWheel != 0) {
+                                orbit_cam.distance *= (1.0f - io.MouseWheel * 0.1f);
+                                orbit_cam.distance = fmaxf(0.5f, fminf(10.0f, orbit_cam.distance));
+                            }
+                        }
+                    }
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
             }
-            ImGui::EndGroup();
 
             ImGui::End();
         }
@@ -594,6 +1034,8 @@ int main(int argc, char** argv) {
 
         frame_counter++;
     }
+
+    vol_renderer.destroy();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
