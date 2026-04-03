@@ -33,6 +33,7 @@ static SweepPoint run_one(aniso::gpu::GpuGrid& grid, SimParams p,
     pt.ohmic  = 0.0f;
 
     grid.init(p);
+    grid.wait_pair_maps();
     grid.step_n(warmup);
 
     std::vector<float> aniso_samples;
@@ -138,8 +139,9 @@ int main(int argc, char* argv[]) {
     base.wall_radius = 0.45f;
     base.wall_z_periodic = 1;
     base.wall_cooling = 2.0f;
-    base.gamma_rad = 0.001f;
-    base.rad_exp = 1.5f;
+    base.cord_radius = 0.8f;
+    base.cord_mass = 1.0f;
+    base.m0 = 0.5f;
     base.grad_tau = 0.3f;
     base.grad_E_ref = 1.0f;
     base.eig_lo = 0.25f;
@@ -158,7 +160,6 @@ int main(int argc, char* argv[]) {
     base.poisson_iters = 50;
     base.sor_omega = 1.7f;
     base.field_update_every = 5;
-    base.beta_scale = 1.0f;
 
     // === Phase 1: coarse grid with ohmic heating ===
     float Ips[]     = {1.0f, 3.0f, 5.0f, 10.0f};

@@ -55,6 +55,7 @@ struct SimParams {
     float wall_radius;
     float tube_length;       // physical z-extent (Nz cells span this)
     int   wall_z_periodic;   // periodic boundary condition in z
+    int   num_pair_maps;     // Kawasaki pair-map pool (CPU-built); random slot per step
 
     // --- Initial conditions ---
     float g_noise_init;
@@ -66,36 +67,44 @@ struct SimParams {
     float t;
     unsigned int step_count;
 
-    // --- Radiation (nonlinear energy loss) ---
-    float gamma_rad;         // P_rad = gamma_rad * E^rad_exp
-    float rad_exp;
+    // --- Plasma medium (mass field) ---
+    float cord_radius;       // initial cord radius (fraction of wall_radius)
+    float cord_mass;         // initial mass per cell inside cord
+    float m0;                // half-saturation for acceptance: alpha = m/(m+m0)
+    float m_ref;             // reference mass for tensor scaling
+    float alpha_m;           // mass power in S_nat: S *= (m/m_ref)^alpha_m
 
     // --- Wall thermal model ---
     float wall_cooling;      // dE_wall/dt -= wall_cooling * E_wall
     float wall_E_max;        // melt threshold
+    // Exchange into wall: transport acceptance = 1 ("zero wall resistance"); energy and
+    // resistive charge heating are deposited into wall_E scaled by this (short-circuit / KZ).
+    float wall_sink_E_gain;
 
     // --- Disruption ---
     float beta_limit;        // thermal quench if center_E > beta_limit (0 = off)
-
-    // --- External Omega (antisymmetric transport: drift perpendicular to grad E) ---
-    float omega_base;        // uniform Omega magnitude (signed: +CCW, -CW)
-    float omega_r_power;     // radial profile: w(r) = omega_base * (r/wall_r)^omega_r_power
 
     // --- Equilibrium (real tokamak geometry) ---
     int   use_equilibrium;
     float chi_parallel;
     float chi_perp;
 
-    // --- Self-consistent B-field (Ohm + Ampere) ---
-    float V_loop;             // loop voltage driving current; Jz = V_loop * E^spitzer
-    float spitzer_exp;        // J_z ~ E^exp (1.5 = Spitzer conductivity)
+    // --- Self-consistent B-field (charge transport + vector Poisson) ---
+    float V_loop;             // loop voltage: Pv = V_loop * (ê·ẑ) on exchange edge (unit dir in x,y,z phys)
+    float spitzer_exp;        // legacy YAML; unused (kept for config compatibility)
     float Bz_ext;             // external axial (toroidal) field magnitude
     int   poisson_iters;      // SOR iterations per field update
-    int   field_update_every; // recompute B-field every N steps (0 = never)
+    int   field_update_every; // recompute B from j_acc every N steps (0 = never)
     float sor_omega;          // SOR over-relaxation factor (1.0–1.9)
-    float field_kappa;        // congruence field suppression strength
-    float beta_scale;         // β degradation: fk_local = fk / (1 + E/(B²·beta_scale))
-    float inv_aspect_ratio;   // ε = a/R₀; centrifugal drift v = ε·E/Bz outward (+x)
+    float field_kappa;        // fk in apply_field_congruence: parallel/perp eigenvalue ratio = 1+fk
+    float inv_aspect_ratio;   // ε = a/R₀; centrifugal mass drift ~ ε·m/Bz on +x edges in k_exchange
+
+    // --- Charge field (3D): q ~ mass scale; MC hop → j_acc → J → ∇²A = -J → B = ∇×A + B_ext ---
+    float charge_mass_scale;  // q = scale * m at init
+    float charge_R0;        // R = R0 / Sab (Sab = edge transport scalar); calibrates resistive scale
+    // Dimensionless; J from j_acc uses face areas in normalized xy (0..1) and tube_length in z:
+    //   Jz  *= scale / (fe*dt*dx^2),   Jx,Jy *= scale / (fe*dt*dx*dz),  dx=1/(max(Nx,Ny)-1), dz=tube_length/Nz
+    float charge_j_scale;
 
     // --- Beam array heating (used when heater_type == HEAT_BEAM_ARRAY) ---
     int   n_beams;            // number of heating beams

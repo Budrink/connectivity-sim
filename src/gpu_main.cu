@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <numeric>
 #include <string>
+#include <fstream>
 
 // ---- Color maps ----
 static ImU32 viridis(float v) {
@@ -47,7 +48,6 @@ struct DisruptionTracker {
     float  wf_spike_ratio = 2.0f;
     float  wf_hard_ratio  = 4.0f;
     float  conf_collapse  = 1.5f;
-    float  wf_flux_limit  = 50.0f;
 
     static constexpr int TREND_N = 8;
     float  conf_window[TREND_N] = {};
@@ -107,16 +107,15 @@ struct DisruptionTracker {
         bool wall_contact = (m.edge_E > 0.3f * m.center_E) && (m.center_E > 0.05f);
         float wE_max = gp.wall_E_max;
         bool wall_melt = (wE_max > 0) && (m.max_wall_E > wE_max);
-        bool wall_flux_overload = (wf_flux_limit > 0) && (wf > wf_flux_limit);
         bool beta_exceeded = (gp.beta_limit > 0) && (m.center_E > gp.beta_limit);
 
         if (!disruption_active) {
             if (beta_exceeded) {
                 disruption_active = true; hard_disruption = true;
                 status_text = "BETA LIMIT";
-            } else if (wall_melt || wall_flux_overload) {
+            } else if (wall_melt) {
                 disruption_active = true; hard_disruption = true;
-                status_text = wall_melt ? "WALL MELT" : "WALL FLUX OVERLOAD";
+                status_text = "WALL MELT";
             } else if (wall_contact) {
                 disruption_active = true; hard_disruption = true;
                 status_text = "WALL CONTACT";
@@ -133,7 +132,7 @@ struct DisruptionTracker {
         if (disruption_active) {
             disruption_timer += dt;
             if (wf > wf_ema * wf_hard_ratio || wall_contact || wall_melt ||
-                wall_flux_overload || beta_exceeded) {
+                beta_exceeded) {
                 hard_disruption = true;
             }
             if (!hard_disruption && wf < wf_ema * 1.2f && disruption_timer > 0.5f) {
@@ -154,7 +153,7 @@ struct TimeSeries {
     std::vector<float> t, total_E, center_E, edge_E;
     std::vector<float> mean_aniso, barrier_aniso;
     std::vector<float> wall_flux, wall_T_peak, radiation;
-    std::vector<float> confinement;
+    std::vector<float> confinement, total_mass;
     int max_len;
     TimeSeries(int ml = 4000) : max_len(ml) {}
     void push(float time, const GlobalMetrics& m) {
@@ -173,6 +172,7 @@ struct TimeSeries {
         ap(wall_T_peak, m.max_wall_E);
         ap(radiation, m.total_radiation);
         ap(confinement, m.confinement);
+        ap(total_mass, m.total_mass);
     }
 };
 
@@ -300,6 +300,14 @@ uniform vec3 uBoxMin;
 uniform vec3 uBoxMax;
 uniform float uWallRadius;
 uniform float uWallAlpha;
+uniform int uColorMode;     // 0 scalar volume, 1 RGB J (dir in rg, |J| in b)
+uniform int uScalarTfMode; // 0 sample uTFTex (hot), 1 blue→white by scalar (for |J|)
+
+vec3 hsv2rgb_vol(float h, float s, float v) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(vec3(h) + K.xyz) * 6.0 - K.www);
+    return v * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), s);
+}
 
 vec2 intersect_box(vec3 orig, vec3 dir, vec3 bmin, vec3 bmax) {
     vec3 inv_dir = 1.0 / dir;
@@ -341,17 +349,43 @@ void main() {
             float dr = abs(r - uWallRadius);
             if (dr < 0.015) {
                 float wall_a = uWallAlpha * (1.0 - dr / 0.015) * uStepSize * 30.0;
+                if (uColorMode != 0)
+                    wall_a *= 0.22;
                 vec3 wall_col = vec3(0.3, 0.5, 0.7);
                 acc.rgb += (1.0 - acc.a) * wall_a * wall_col;
                 acc.a   += (1.0 - acc.a) * wall_a;
             }
         }
 
-        float val = texture(uVolTex, tc).r;
-        float nv  = clamp((val - uLo) * range_inv, 0.0, 1.0);
-        vec4  c   = texture(uTFTex, nv);
-        float a   = c.a * uOpacity * uStepSize * 50.0;
-        acc.rgb += (1.0 - acc.a) * a * c.rgb;
+        vec4 t4 = texture(uVolTex, tc);
+        vec3 samp_rgb;
+        float samp_a;
+        if (uColorMode != 0) {
+            vec2 dir = (t4.rg - 0.5) * 2.0;
+            float jm = t4.b;
+            float nv = clamp((jm - uLo) * range_inv, 0.0, 1.0);
+            float jxy = length(dir);
+            float hue = (jxy > 0.03) ? (atan(dir.y, dir.x) * 0.159154943 + 0.5) : 0.0;
+            float sat = min(1.0, jxy * 1.65);
+            float val = 0.2 + 0.8 * pow(max(nv, 0.0), 0.75);
+            samp_rgb = hsv2rgb_vol(hue, sat, val);
+            samp_a = 0.025 + 0.38 * nv * (0.4 + 0.6 * min(1.0, jxy * 1.8));
+        } else if (uScalarTfMode != 0) {
+            float nv = clamp((t4.r - uLo) * range_inv, 0.0, 1.0);
+            float nt = pow(max(nv, 0.0), 0.82);
+            vec3 coldJ = vec3(0.03, 0.07, 0.38);
+            vec3 hotJ  = vec3(1.0, 1.0, 1.0);
+            samp_rgb = mix(coldJ, hotJ, nt);
+            samp_a = 0.06 + 0.52 * nv;
+        } else {
+            float nv = clamp((t4.r - uLo) * range_inv, 0.0, 1.0);
+            vec4 c = texture(uTFTex, nv);
+            samp_rgb = c.rgb;
+            samp_a = c.a;
+        }
+        float stepBoost = (uColorMode != 0) ? 22.0 : 48.0;
+        float a = samp_a * uOpacity * uStepSize * stepBoost;
+        acc.rgb += (1.0 - acc.a) * a * samp_rgb;
         acc.a   += (1.0 - acc.a) * a;
         if (acc.a > 0.95) break;
     }
@@ -382,12 +416,15 @@ struct VolumeRenderer {
     GLuint fbo = 0, fbo_col = 0, fbo_dep = 0;
     int fbo_w = 0, fbo_h = 0;
     int vnx = 0, vny = 0, vnz = 0;
+    int vol_ch_ = 1;
     std::vector<float> staging;
 
     GLint u_mvp_inv = -1, u_cam_pos = -1, u_vol_tex = -1, u_tf_tex = -1;
     GLint u_opacity = -1, u_lo = -1, u_hi = -1, u_step = -1;
     GLint u_box_min = -1, u_box_max = -1;
     GLint u_wall_radius = -1, u_wall_alpha = -1;
+    GLint u_color_mode = -1;
+    GLint u_scalar_tf_mode = -1;
 
     static GLuint compile_gl(GLenum type, const char* src) {
         GLuint s = glCreateShader(type);
@@ -422,6 +459,8 @@ struct VolumeRenderer {
         u_box_max = glGetUniformLocation(prog, "uBoxMax");
         u_wall_radius = glGetUniformLocation(prog, "uWallRadius");
         u_wall_alpha  = glGetUniformLocation(prog, "uWallAlpha");
+        u_color_mode  = glGetUniformLocation(prog, "uColorMode");
+        u_scalar_tf_mode = glGetUniformLocation(prog, "uScalarTfMode");
 
         glGenVertexArrays(1, &vao);
         build_tf();
@@ -470,26 +509,37 @@ struct VolumeRenderer {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    void update_volume(const float* data, int nx, int ny, int nz, int display_nz = 0) {
+    void update_volume(const float* data, int nx, int ny, int nz, int display_nz = 0,
+                       int ch = 1) {
+        int new_ch = (ch == 3) ? 3 : 1;
+        int prev_ch = vol_ch_;
+        vol_ch_ = new_ch;
         int dnz = (display_nz > 0) ? display_nz : nz;
-        int n = nx * ny * dnz;
-        staging.resize(n);
+        size_t per = (size_t)vol_ch_;
+        staging.resize((size_t)nx * ny * dnz * per);
 
-        for (int i = 0; i < nx; i++)
-            for (int j = 0; j < ny; j++)
-                for (int dk = 0; dk < dnz; dk++) {
-                    int sk = (nz > 1) ? (dk * nz / dnz) : 0;
-                    staging[(dk * ny + j) * nx + i] = data[(i * ny + j) * nz + sk];
+        for (int dk = 0; dk < dnz; ++dk) {
+            int sk = (nz > 1) ? (dk * nz / dnz) : 0;
+            for (int j = 0; j < ny; ++j) {
+                for (int i = 0; i < nx; ++i) {
+                    size_t si = (size_t)((i * ny + j) * nz + sk) * per;
+                    size_t so = (size_t)(((dk * ny + j) * nx + i) * per);
+                    for (size_t c = 0; c < per; ++c)
+                        staging[so + c] = data[si + c];
                 }
+            }
+        }
 
-        bool need_resize = (!vol_tex || nx != vnx || ny != vny || dnz != vnz);
+        bool need_resize = (!vol_tex || nx != vnx || ny != vny || dnz != vnz || new_ch != prev_ch);
         vnx = nx; vny = ny; vnz = dnz;
+        GLenum internal = (vol_ch_ == 3) ? GL_RGB32F : GL_R32F;
+        GLenum format = (vol_ch_ == 3) ? GL_RGB : GL_RED;
         if (need_resize) {
             if (vol_tex) glDeleteTextures(1, &vol_tex);
             glGenTextures(1, &vol_tex);
             glBindTexture(GL_TEXTURE_3D, vol_tex);
-            glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, nx, ny, dnz, 0,
-                         GL_RED, GL_FLOAT, staging.data());
+            glTexImage3D(GL_TEXTURE_3D, 0, internal, nx, ny, dnz, 0,
+                         format, GL_FLOAT, staging.data());
             glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -497,13 +547,14 @@ struct VolumeRenderer {
             glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
         } else {
             glBindTexture(GL_TEXTURE_3D, vol_tex);
-            glTexSubImage3D(GL_TEXTURE_3D, 0, 0,0,0, nx, ny, dnz,
-                            GL_RED, GL_FLOAT, staging.data());
+            glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, nx, ny, dnz,
+                            format, GL_FLOAT, staging.data());
         }
     }
 
     GLuint render(int w, int h, const OrbitCamera& cam, float opacity, float lo, float hi,
-                  float wall_radius = 0.45f, float wall_alpha = 0.3f) {
+                  float wall_radius = 0.45f, float wall_alpha = 0.3f, int color_mode = 0,
+                  int scalar_tf_mode = 0) {
         if (!vol_tex || !prog) return 0;
         ensure_fbo(w, h);
 
@@ -536,6 +587,10 @@ struct VolumeRenderer {
         glUniform1f(u_step, step_sz);
         glUniform1f(u_wall_radius, wall_radius);
         glUniform1f(u_wall_alpha, wall_alpha);
+        if (u_color_mode >= 0)
+            glUniform1i(u_color_mode, color_mode);
+        if (u_scalar_tf_mode >= 0)
+            glUniform1i(u_scalar_tf_mode, scalar_tf_mode);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_3D, vol_tex);
         glUniform1i(u_vol_tex, 0);
@@ -570,8 +625,9 @@ struct VolumeRenderer {
 static void draw_heatmap_slice(const char* label, const float* data,
                                int Nx, int Ny, int Nz, int z_slice,
                                ImU32 (*cmap)(float), float lo, float hi, float sz) {
-    ImGui::BeginChild(label, ImVec2(sz+20, sz+30), true);
+    ImGui::BeginChild(label, ImVec2(sz+20, sz+44), true);
     ImGui::Text("%s  z=%d/%d", label, z_slice, Nz);
+    ImGui::TextColored(ImVec4(0.65f, 0.75f, 0.95f, 1.f), "colormap [%.3g, %.3g]", (double)lo, (double)hi);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
 
     int step = 1;
@@ -621,6 +677,16 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Volume renderer init failed (non-fatal)\n");
 
     std::string cfg = (argc > 1) ? argv[1] : "";
+    if (cfg.empty()) {
+        static const char* kDefaultCfg[] = {"configs/tube_3d.yaml", "../configs/tube_3d.yaml"};
+        for (const char* c : kDefaultCfg) {
+            std::ifstream test(c, std::ios::binary);
+            if (test.good()) {
+                cfg = c;
+                break;
+            }
+        }
+    }
     SimParams sp;
     if (!cfg.empty()) {
         try { sp = aniso::gpu::load_sim_params(cfg); }
@@ -669,13 +735,26 @@ int main(int argc, char** argv) {
     bool  vol_use_map_E_scale = false;
     float wall_tube_alpha = 0.3f;
     bool  show_3d = true;
+    int   vol_data_mode = 0;  // 0=E, 1=m, 2=E/m, 3=|J| blue-white, 4=|B|, 5=J RGB+dir
+    float vol_em_max = 15.0f; // upper scale for 3D E/m mode
+    float vol_J_max = 5.0f;
+    float vol_B_max = 15.0f;
     int   z_slice = 0;
     int   vol_display_nz = 32;
+    std::vector<float> vol_em_;
+
+    bool  mass_viz_autoscale = true;
+    float mass_col_hi = 1.0f;
+    float mass_col_manual_max = 2.0f;
+    const float controls_panel_w = 480.f;
+    // Slider drag width: if = full panel, numeric format gets squeezed off-screen
+    const float controls_slider_w = 220.f;
 
     while (!glfwWindowShouldClose(win)) {
+        grid.poll_pair_maps();
         glfwPollEvents();
 
-        if (!paused) {
+        if (!paused && grid.pair_maps_ready()) {
             grid.step_n(steps_per_frame);
         }
 
@@ -699,27 +778,77 @@ int main(int argc, char** argv) {
                 E_scale = fmaxf(maxE / std::max(m.n_interior,1) * 3.0f, 0.5f);
             }
 
-            if (show_3d)
-                vol_renderer.update_volume(grid.h_E(), Nx, Ny, Nz,
-                                           (Nz == 1) ? vol_display_nz : 0);
+            if (mass_viz_autoscale) {
+                const float* hm = grid.h_mass();
+                int nt = Nx * Ny * Nz;
+                float mx = 0.f;
+                for (int i = 0; i < nt; ++i)
+                    mx = fmaxf(mx, hm[i]);
+                float target = fmaxf(mx * 1.2f, 1e-10f);
+                mass_col_hi = 0.88f * mass_col_hi + 0.12f * target;
+            }
+        }
+
+        if (show_3d) {
+            const float* vol_src = grid.h_E();
+            int vol_tex_ch = 1;
+            if (vol_data_mode == 1) {
+                vol_src = grid.h_mass();
+            } else if (vol_data_mode == 2) {
+                int nt = Nx * Ny * Nz;
+                if ((int)vol_em_.size() != nt)
+                    vol_em_.resize((size_t)nt);
+                const float* he = grid.h_E();
+                const float* hm = grid.h_mass();
+                for (int i = 0; i < nt; i++)
+                    vol_em_[i] = he[i] / fmaxf(hm[i], 1e-8f);
+                vol_src = vol_em_.data();
+            } else if (vol_data_mode == 3 && Nz > 1) {
+                vol_src = grid.h_J_mag();
+            } else if (vol_data_mode == 4 && Nz > 1) {
+                vol_src = grid.h_B_mag();
+            } else if (vol_data_mode == 5 && Nz > 1) {
+                vol_src = grid.h_J_vis();
+                vol_tex_ch = 3;
+            }
+            vol_renderer.update_volume(vol_src, Nx, Ny, Nz,
+                                       (Nz == 1) ? vol_display_nz : 0,
+                                       vol_tex_ch);
         }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        if (!mass_viz_autoscale)
+            mass_col_hi = fmaxf(mass_col_manual_max, 1e-10f);
+
+        const float status_bar_h = grid.pair_maps_ready() ? 38.f : 58.f;
+
         // ===== Top status bar =====
         {
             ImGui::SetNextWindowPos(ImVec2(0,0));
-            ImGui::SetNextWindowSize(ImVec2((float)io.DisplaySize.x, 38));
+            ImGui::SetNextWindowSize(ImVec2((float)io.DisplaySize.x, status_bar_h));
             ImGui::Begin("##StatusBar", nullptr,
                          ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|
                          ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar);
 
             const auto& m = grid.metrics();
-            ImGui::Text("t=%.2f | step=%u | E_tot=%.1f | center=%.2f | edge=%.2f | confine=%.1f",
+            if (!grid.pair_maps_ready()) {
+                char pm_ovl[72];
+                std::snprintf(pm_ovl, sizeof(pm_ovl), "%d / %d  (CPU, GUI live)",
+                              grid.pair_map_build_done_count(),
+                              grid.pair_map_build_total_count());
+                ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                                      ImVec4(0.35f, 0.65f, 0.95f, 1.f));
+                ImGui::ProgressBar(grid.pair_map_build_progress(),
+                                   ImVec2(ImGui::GetContentRegionAvail().x, 18.f),
+                                   pm_ovl);
+                ImGui::PopStyleColor();
+            }
+            ImGui::Text("t=%.2f | step=%u | E=%.1f | M=%.1f | center=%.2f | edge=%.2f | conf=%.1f",
                         grid.t(), grid.params().step_count,
-                        m.total_E, m.center_E, m.edge_E, m.confinement);
+                        m.total_E, m.total_mass, m.center_E, m.edge_E, m.confinement);
             ImGui::SameLine(ImGui::GetWindowWidth()-250);
 
             {
@@ -741,9 +870,11 @@ int main(int argc, char** argv) {
 
         // ===== Control Panel =====
         {
-            ImGui::SetNextWindowPos(ImVec2(0, 40));
-            ImGui::SetNextWindowSize(ImVec2(300, io.DisplaySize.y - 40));
+            ImGui::SetNextWindowPos(ImVec2(0, status_bar_h));
+            ImGui::SetNextWindowSize(ImVec2(controls_panel_w, io.DisplaySize.y - status_bar_h));
             ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoResize);
+
+            ImGui::PushItemWidth(controls_slider_w);
 
             if (ImGui::Button(paused ? "Resume" : "Pause")) {
                 if (paused && dtrack.hard_disruption)
@@ -760,11 +891,17 @@ int main(int argc, char** argv) {
 
             auto& pp = grid.params();
 
-            ImGui::Separator(); ImGui::Text("Radiation / Wall");
-            ImGui::SliderFloat("gamma_rad", &pp.gamma_rad, 0, 0.5f, "%.3f");
-            ImGui::SliderFloat("rad_exp", &pp.rad_exp, 1.0f, 2.5f, "%.2f");
+            ImGui::Separator(); ImGui::Text("Plasma Medium");
+            ImGui::SliderFloat("cord_radius", &pp.cord_radius, 0.1f, 1.0f, "%.2f");
+            ImGui::SliderFloat("cord_mass", &pp.cord_mass, 0.01f, 10.0f, "%.2f");
+            ImGui::SliderFloat("m0 (accept)", &pp.m0, 0.01f, 5.0f, "%.2f");
+            ImGui::SliderFloat("m_ref", &pp.m_ref, 0.01f, 10.0f, "%.2f");
+            ImGui::SliderFloat("alpha_m", &pp.alpha_m, 0.0f, 3.0f, "%.2f");
+
+            ImGui::Separator(); ImGui::Text("Wall");
             ImGui::SliderFloat("wall_cool", &pp.wall_cooling, 0.1f, 50.0f, "%.1f");
             ImGui::SliderFloat("wall_Emax", &pp.wall_E_max, 1.0f, 500.0f, "%.0f");
+            ImGui::SliderFloat("wall sink heat gain", &pp.wall_sink_E_gain, 0.0f, 200.0f, "%.1f");
 
             ImGui::Separator(); ImGui::Text("Heater");
             const char* htypes[] = {"constant","pulsed","event_driven","aniso_aware","target","beam_array"};
@@ -815,11 +952,12 @@ int main(int argc, char** argv) {
                 ImGui::Separator(); ImGui::Text("Self-consistent B-field");
                 ImGui::SliderInt("field update N", &pp.field_update_every, 0, 100);
                 if (pp.field_update_every > 0) {
-                    ImGui::SliderFloat("V_loop", &pp.V_loop, 0.0f, 1.0f, "%.4f");
+                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, -0.2f, 0.2f, "%.4f");
                     ImGui::SliderFloat("Bz_ext", &pp.Bz_ext, 0.0f, 50.0f, "%.2f");
-                    ImGui::SliderFloat("spitzer_exp", &pp.spitzer_exp, 0.5f, 3.0f, "%.1f");
+                    ImGui::SliderFloat("charge_mass_scale", &pp.charge_mass_scale, 0.0f, 5.0f, "%.2f");
+                    ImGui::SliderFloat("charge R0", &pp.charge_R0, 1e-8f, 1.0f, "%.6f");
+                    ImGui::SliderFloat("charge_j_scale", &pp.charge_j_scale, 1e-6f, 10.0f, "%.5f");
                     ImGui::SliderFloat("field_kappa", &pp.field_kappa, 0.0f, 50.0f, "%.1f");
-                    ImGui::SliderFloat("beta_scale", &pp.beta_scale, 0.1f, 100.0f, "%.1f");
                     ImGui::SliderFloat("inv_aspect (a/R0)", &pp.inv_aspect_ratio, 0.0f, 10.0f, "%.2f");
                     ImGui::SliderInt("SOR iters", &pp.poisson_iters, 5, 2000);
                     ImGui::SliderFloat("SOR omega", &pp.sor_omega, 1.0f, 1.95f, "%.2f");
@@ -829,7 +967,6 @@ int main(int argc, char** argv) {
 
             ImGui::Separator(); ImGui::Text("Beta / Disruption");
             ImGui::SliderFloat("beta_limit", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
-            ImGui::SliderFloat("wf_flux_lim", &dtrack.wf_flux_limit, 0.0f, 200.0f, "%.0f");
             ImGui::SliderFloat("spike_ratio", &dtrack.wf_spike_ratio, 1.5f, 10.0f, "%.1f");
             ImGui::SliderInt("warmup", &dtrack.warmup_steps, 0, 20000);
 
@@ -847,10 +984,42 @@ int main(int argc, char** argv) {
             ImGui::Separator(); ImGui::Text("3D Volume");
             ImGui::Checkbox("Show 3D", &show_3d);
             if (show_3d) {
+                const char* vol_modes[] = {
+                    "Energy", "Mass", "E / m",
+                    "|J|", "|B|",
+                    "J (dir + |J|)"};
+                ImGui::Combo("Vol data", &vol_data_mode, vol_modes, IM_ARRAYSIZE(vol_modes));
+                if (vol_data_mode == 3) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
+                    ImGui::TextWrapped(
+                        "|J| magnitude only. 3D uses dark blue → white (not the yellow hot TF). "
+                        "Same j_acc / Poisson J as below. Between field updates, |J| is frozen.");
+                    ImGui::PopStyleColor();
+                }
+                if (vol_data_mode == 4) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
+                    ImGui::TextWrapped(
+                        "|B| = √(Bx²+By²+Bz²) from eq_b*: B = ∇×A plus Bz_ext profile. "
+                        "Magnetic induction, not current density.");
+                    ImGui::PopStyleColor();
+                }
+                if (vol_data_mode == 5) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
+                    ImGui::TextWrapped(
+                        "Hue = (Jx,Jy) direction in xy, brightness ∝ |J|. More transparent than scalar |J|. "
+                        "Wall voxels show neighbor-averaged J (contact). Raise Vol opacity if too faint.");
+                    ImGui::PopStyleColor();
+                }
                 ImGui::SliderFloat("Vol opacity", &vol_opacity, 0.1f, 5.0f, "%.1f");
                 ImGui::Checkbox("3D use 2D E_scale", &vol_use_map_E_scale);
-                if (!vol_use_map_E_scale)
+                if (!vol_use_map_E_scale && vol_data_mode == 0)
                     ImGui::SliderFloat("Vol E max", &vol_E_max, 0.5f, 200.0f, "%.1f");
+                if (vol_data_mode == 2)
+                    ImGui::SliderFloat("Vol E/m max", &vol_em_max, 0.1f, 500.0f, "%.1f");
+                if (vol_data_mode == 3 || vol_data_mode == 5)
+                    ImGui::SliderFloat("Vol |J| max", &vol_J_max, 0.01f, 500.0f, "%.2f");
+                if (vol_data_mode == 4)
+                    ImGui::SliderFloat("Vol |B| max", &vol_B_max, 0.1f, 200.0f, "%.1f");
                 ImGui::SliderFloat("Tube wall", &wall_tube_alpha, 0.0f, 1.0f, "%.2f");
                 ImGui::SliderInt("Vol depth", &vol_display_nz, 1, 64);
             }
@@ -861,15 +1030,23 @@ int main(int argc, char** argv) {
             ImGui::SliderFloat("aniso_scale", &aniso_scale, 0.1f, 20.0f);
             ImGui::SliderFloat("gradE_scale", &gradE_scale, 1.0f, 1000.0f);
 
+            ImGui::Separator();
+            ImGui::Text("Mass display (2D slice + vol)");
+            ImGui::Checkbox("Mass autoscale", &mass_viz_autoscale);
+            if (!mass_viz_autoscale)
+                ImGui::SliderFloat("Mass color max", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
+
+            ImGui::PopItemWidth();
             ImGui::End();
         }
 
         // ===== Field Maps =====
         {
-            float mapx = 305;
-            int maps_per_row = 3;
-            ImGui::SetNextWindowPos(ImVec2(mapx, 40));
-            ImGui::SetNextWindowSize(ImVec2(map_size*maps_per_row+60, map_size*2+100));
+            float mapx = controls_panel_w + 8.f;
+            // Child widgets are (map_size+20) wide; three in a row need extra slack + spacing
+            const float field_maps_w = 3.f * (map_size + 24.f) + 56.f;
+            ImGui::SetNextWindowPos(ImVec2(mapx, status_bar_h));
+            ImGui::SetNextWindowSize(ImVec2(field_maps_w, map_size * 2.f + 100.f));
             ImGui::Begin("Field Maps", nullptr, ImGuiWindowFlags_NoResize);
 
             if (ImGui::BeginTabBar("FieldTabs")) {
@@ -896,12 +1073,12 @@ int main(int argc, char** argv) {
                         draw_heatmap("|grad E|^2", gEdata, Nx, Ny, hot, 0, gradE_scale, map_size);
                         ImGui::EndGroup();
                     } else {
-                        const float* wedata = grid.h_wall_E();
+                        const float* mdata = grid.h_mass();
                         ImGui::BeginGroup();
                         draw_heatmap_slice("Energy (E)", edata, Nx, Ny, Nz, z_slice, hot, 0, E_scale, map_size);
                         ImGui::SameLine();
-                        draw_heatmap_slice("Wall T", wedata, Nx, Ny, Nz, z_slice, hot, 0,
-                                          fmaxf(grid.params().wall_E_max, 1.0f), map_size);
+                        draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, viridis, 0.f,
+                                          mass_col_hi, map_size);
                         ImGui::SameLine();
                         draw_heatmap_slice("|grad E|^2", gEdata, Nx, Ny, Nz, z_slice, hot, 0, gradE_scale, map_size);
                         ImGui::EndGroup();
@@ -936,9 +1113,20 @@ int main(int argc, char** argv) {
                     int vh = std::max((int)avail.y - 10, 64);
 
                     float vol_hi = vol_use_map_E_scale ? E_scale : vol_E_max;
+                    if (vol_data_mode == 1)
+                        vol_hi = mass_col_hi;
+                    else if (vol_data_mode == 2)
+                        vol_hi = fmaxf(vol_em_max, 0.1f);
+                    else if (vol_data_mode == 3 || vol_data_mode == 5)
+                        vol_hi = fmaxf(vol_J_max, 0.01f);
+                    else if (vol_data_mode == 4)
+                        vol_hi = fmaxf(vol_B_max, 0.01f);
+                    int vol_color_mode = (vol_data_mode == 5 && Nz > 1) ? 1 : 0;
+                    int vol_scalar_tf = (vol_data_mode == 3 && Nz > 1) ? 1 : 0;
                     GLuint vtex = vol_renderer.render(vw, vh, orbit_cam,
                                                       vol_opacity, 0.0f, vol_hi,
-                                                      grid.params().wall_radius, wall_tube_alpha);
+                                                      grid.params().wall_radius, wall_tube_alpha,
+                                                      vol_color_mode, vol_scalar_tf);
                     if (vtex) {
                         ImGui::Image((ImTextureID)(intptr_t)vtex,
                                      ImVec2((float)vw, (float)vh),
@@ -966,11 +1154,12 @@ int main(int argc, char** argv) {
 
         // ===== Time series plots =====
         {
-            float plotx = 305 + map_size*3 + 70;
+            const float field_maps_w_plot = 3.f * (map_size + 24.f) + 56.f;
+            float plotx = controls_panel_w + 8.f + field_maps_w_plot + 14.f;
             float plotw = io.DisplaySize.x - plotx - 5;
             if (plotw < 200) plotw = 200;
-            ImGui::SetNextWindowPos(ImVec2(plotx, 40));
-            ImGui::SetNextWindowSize(ImVec2(plotw, io.DisplaySize.y - 40));
+            ImGui::SetNextWindowPos(ImVec2(plotx, status_bar_h));
+            ImGui::SetNextWindowSize(ImVec2(plotw, io.DisplaySize.y - status_bar_h));
             ImGui::Begin("Diagnostics", nullptr, ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoResize);
 
             if (ImGui::CollapsingHeader("Energy", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -992,8 +1181,8 @@ int main(int argc, char** argv) {
             if (ImGui::CollapsingHeader("Wall Temperature")) {
                 plot_series("##WallT", ts.t, ts.wall_T_peak, 100);
             }
-            if (ImGui::CollapsingHeader("Radiation")) {
-                plot_series("##Radiation", ts.t, ts.radiation, 100);
+            if (ImGui::CollapsingHeader("Mass", ImGuiTreeNodeFlags_DefaultOpen)) {
+                plot_series("##Mass", ts.t, ts.total_mass, 100);
             }
             if (ImGui::CollapsingHeader("Anisotropy")) {
                 if (ImPlot::BeginPlot("##Aniso", ImVec2(-1,100))) {
@@ -1017,7 +1206,7 @@ int main(int argc, char** argv) {
             ImGui::BulletText("Wall flux: %.4f", m.total_wall_flux);
             ImGui::BulletText("Wall T peak: %.2f / %.0f", m.max_wall_E, grid.params().wall_E_max);
             ImGui::BulletText("Wall T mean: %.3f", m.mean_wall_E);
-            ImGui::BulletText("Radiation: %.3f", m.total_radiation);
+            ImGui::BulletText("Total mass: %.1f", m.total_mass);
 
             ImGui::End();
         }

@@ -1,5 +1,5 @@
 # 3D tube with self-consistent B-field
-# 128x128 cross-section, 256 axial layers, periodic z
+# 128x128 cross-section, 32 axial layers, periodic z (toroidal)
 
 grid:
   Nx: 128
@@ -8,6 +8,7 @@ grid:
   wall_radius: 0.45
   tube_length: 1.0
   wall_z_periodic: 1
+  num_pair_maps: 32
   g_noise_init: 0.05
   heat_profile:
     cx: 0.5
@@ -40,13 +41,17 @@ g_response:
   grad_tau: 0.3
   grad_E_ref: 1.0
 
-radiation:
-  gamma_rad: 0.001
-  rad_exp: 1.5
+medium:
+  cord_radius: 0.8
+  cord_mass: 1.0
+  m0: 0.5
+  m_ref: 1.0
+  alpha_m: 1.0
 
 wall:
   cooling: 2.0
   E_max: 100.0
+  sink_E_gain: 50.0   # ohmic heating multiplier when current/plasma hits wall (exchange path)
 
 equilibrium:
   chi_parallel: 1.0
@@ -54,14 +59,18 @@ equilibrium:
 
 field:
   V_loop: 0.01
-  spitzer_exp: 1.5
+  spitzer_exp: 1.5   # legacy key, ignored
   Bz_ext: 2.0
   poisson_iters: 500
   update_every: 2
   sor_omega: 1.7
   kappa: 10.0
-  beta_scale: 10.0
   inv_aspect_ratio: 0.1
+
+charge:
+  mass_scale: 1.0
+  R0: 0.0001
+  j_scale: 0.001
 
 beams:
   n_beams: 0

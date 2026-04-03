@@ -5,8 +5,11 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 #include <stdexcept>
 #include <chrono>
+#include <future>
+#include <random>
 
 #define CK(call) do {                                             \
     cudaError_t e = (call);                                       \
@@ -19,12 +22,101 @@
 
 namespace aniso { namespace gpu {
 
+static int clamp_num_pair_maps(int n) {
+    if (n < 1) return 1;
+    if (n > 8192) return 8192;
+    return n;
+}
+
+static void build_pair_map_into(std::vector<unsigned char>& out,
+                                const std::vector<unsigned char>& h_wall,
+                                const SimParams& p,
+                                int num_maps,
+                                std::atomic<int>* slot_progress) {
+    const int Nx = p.Nx, Ny = p.Ny, Nz = p.Nz;
+    const int N = Nx * Ny * Nz;
+    if ((int)h_wall.size() != N || (int)out.size() != N * num_maps)
+        throw std::runtime_error("build_pair_map_into: size mismatch");
+
+    static const int DIRS[26][3] = {
+        {-1,-1,-1},{-1,-1, 0},{-1,-1, 1},{-1, 0,-1},{-1, 0, 0},{-1, 0, 1},
+        {-1, 1,-1},{-1, 1, 0},{-1, 1, 1},{ 0,-1,-1},{ 0,-1, 0},{ 0,-1, 1},
+        { 0, 0,-1},                       { 0, 0, 1},
+        { 0, 1,-1},{ 0, 1, 0},{ 0, 1, 1},
+        { 1,-1,-1},{ 1,-1, 0},{ 1,-1, 1},{ 1, 0,-1},{ 1, 0, 0},{ 1, 0, 1},
+        { 1, 1,-1},{ 1, 1, 0},{ 1, 1, 1}
+    };
+
+    long long sum_owners = 0;
+    for (int slot = 0; slot < num_maps; slot++) {
+        unsigned char* slot_out = out.data() + (size_t)slot * N;
+        std::fill(slot_out, slot_out + N, (unsigned char)13);
+        std::vector<bool> paired(N, false);
+        std::vector<int> order(N);
+        std::iota(order.begin(), order.end(), 0);
+        std::mt19937 rng(10007u * (unsigned)slot + 42u);
+        std::shuffle(order.begin(), order.end(), rng);
+        int perm[26];
+
+        for (int idx : order) {
+            if (paired[idx] || h_wall[idx]) continue;
+            int k = idx % Nz;
+            int j = (idx / Nz) % Ny;
+            int i = idx / (Ny * Nz);
+
+            std::iota(perm, perm + 26, 0);
+            for (int a = 25; a > 0; a--) {
+                int b = rng() % (a + 1);
+                int t = perm[a]; perm[a] = perm[b]; perm[b] = t;
+            }
+
+            for (int pi = 0; pi < 26; pi++) {
+                int d = perm[pi];
+                int ni = i + DIRS[d][0], nj = j + DIRS[d][1];
+                int nk = k + DIRS[d][2];
+                if (ni < 0 || ni >= Nx || nj < 0 || nj >= Ny) continue;
+                if (Nz > 1) {
+                    if (p.wall_z_periodic)
+                        nk = ((nk % Nz) + Nz) % Nz;
+                    else if (nk < 0 || nk >= Nz) continue;
+                } else if (nk != 0) continue;
+
+                int nidx = (ni * Ny + nj) * Nz + nk;
+                if (paired[nidx]) continue;
+                // Wall cells are allowed as pair targets (transport sink / return current).
+
+                int code = (DIRS[d][0]+1)*9 + (DIRS[d][1]+1)*3 + (DIRS[d][2]+1);
+                slot_out[idx] = (unsigned char)code;
+                paired[idx] = true;
+                paired[nidx] = true;
+                break;
+            }
+        }
+
+        int n_owners = 0;
+        for (int i = 0; i < N; i++)
+            if (slot_out[i] != 13) n_owners++;
+        sum_owners += n_owners;
+        if (slot_progress)
+            slot_progress->fetch_add(1, std::memory_order_relaxed);
+    }
+
+    int n_interior = 0;
+    for (int i = 0; i < N; i++)
+        if (!h_wall[i]) n_interior++;
+    float avg_pct = 100.0f * (float)(2 * sum_owners)
+                  / (float)(std::max(n_interior, 1) * num_maps);
+    fprintf(stderr, "Pair maps x%d: avg %.1f%% interior paired per map\n",
+            num_maps, avg_pct);
+}
+
 void GpuGrid::alloc_all() {
     int n = total_;
     auto af = [&](float** p) { CK(cudaMalloc(p, n*sizeof(float))); };
     auto au = [&](unsigned char** p) { CK(cudaMalloc(p, n)); };
 
     af(&fields_.E); af(&fields_.E_buf);
+    af(&fields_.m); af(&fields_.m_buf);
     af(&fields_.s00); af(&fields_.s01); af(&fields_.s02);
     af(&fields_.s11); af(&fields_.s12); af(&fields_.s22);
     af(&fields_.s00_buf); af(&fields_.s01_buf); af(&fields_.s02_buf);
@@ -39,29 +131,45 @@ void GpuGrid::alloc_all() {
     af(&fields_.eq_psi_norm); af(&fields_.eq_q);
     af(&fields_.eq_bR); af(&fields_.eq_bZ); af(&fields_.eq_bPhi);
 
-    af(&fields_.Jz); af(&fields_.Az);
+    af(&fields_.q); af(&fields_.q_buf);
+    af(&fields_.j_acc_x); af(&fields_.j_acc_y); af(&fields_.j_acc_z);
+    af(&fields_.Jx); af(&fields_.Jy); af(&fields_.Jz);
+    af(&fields_.Ax); af(&fields_.Ay); af(&fields_.Az);
 
     fields_.beam_data = nullptr;
     if (params_.n_beams > 0) {
         CK(cudaMalloc(&fields_.beam_data, params_.n_beams * 3 * sizeof(float)));
     }
 
-    af(&fields_.rb_E); af(&fields_.rb_aniso); af(&fields_.rb_aniso_angle);
+    CK(cudaMalloc(&fields_.pair_map,
+                  (size_t)total_ * (size_t)params_.num_pair_maps));
+
+    af(&fields_.rb_E); af(&fields_.rb_mass);
+    af(&fields_.rb_aniso); af(&fields_.rb_aniso_angle);
     af(&fields_.rb_wall_flux); af(&fields_.rb_gradE_sq);
     af(&fields_.rb_psi_norm);
+    af(&fields_.rb_J_mag);
+    af(&fields_.rb_B_mag);
+    CK(cudaMalloc(&fields_.rb_J_vis, (size_t)n * 3u * sizeof(float)));
 
     CK(cudaMalloc(&d_metrics_, sizeof(GlobalMetrics)));
 
-    h_E_.resize(n); h_aniso_.resize(n); h_aniso_angle_.resize(n);
+    h_E_.resize(n); h_mass_.resize(n);
+    h_aniso_.resize(n); h_aniso_angle_.resize(n);
     h_wall_flux_.resize(n); h_wall_E_.resize(n);
     h_gradE_sq_.resize(n); h_psi_norm_.resize(n);
+    h_J_mag_.resize(n);
+    h_B_mag_.resize(n);
+    h_J_vis_.resize((size_t)n * 3u);
 }
 
 void GpuGrid::free_all() {
+    discard_pending_pair_map_build();
     auto ff = [](float* p) { if (p) cudaFree(p); };
     auto fu = [](unsigned char* p) { if (p) cudaFree(p); };
 
     ff(fields_.E); ff(fields_.E_buf);
+    ff(fields_.m); ff(fields_.m_buf);
     ff(fields_.s00); ff(fields_.s01); ff(fields_.s02);
     ff(fields_.s11); ff(fields_.s12); ff(fields_.s22);
     ff(fields_.s00_buf); ff(fields_.s01_buf); ff(fields_.s02_buf);
@@ -76,12 +184,20 @@ void GpuGrid::free_all() {
     ff(fields_.eq_psi_norm); ff(fields_.eq_q);
     ff(fields_.eq_bR); ff(fields_.eq_bZ); ff(fields_.eq_bPhi);
 
-    ff(fields_.Jz); ff(fields_.Az);
+    ff(fields_.q); ff(fields_.q_buf);
+    ff(fields_.j_acc_x); ff(fields_.j_acc_y); ff(fields_.j_acc_z);
+    ff(fields_.Jx); ff(fields_.Jy); ff(fields_.Jz);
+    ff(fields_.Ax); ff(fields_.Ay); ff(fields_.Az);
     ff(fields_.beam_data);
+    fu(fields_.pair_map);
 
-    ff(fields_.rb_E); ff(fields_.rb_aniso); ff(fields_.rb_aniso_angle);
+    ff(fields_.rb_E); ff(fields_.rb_mass);
+    ff(fields_.rb_aniso); ff(fields_.rb_aniso_angle);
     ff(fields_.rb_wall_flux); ff(fields_.rb_gradE_sq);
     ff(fields_.rb_psi_norm);
+    ff(fields_.rb_J_mag);
+    ff(fields_.rb_B_mag);
+    ff(fields_.rb_J_vis);
 
     if (d_metrics_) cudaFree(d_metrics_);
     std::memset(&fields_, 0, sizeof(fields_));
@@ -224,25 +340,133 @@ void GpuGrid::upload_equilibrium() {
     printf("Uploaded equilibrium to GPU: %dx%dx%d sim grid\n", simNx, simNy, Nz);
 }
 
+void GpuGrid::discard_pending_pair_map_build() {
+    pair_map_build_done_.store(0, std::memory_order_relaxed);
+    pair_map_build_total_.store(0, std::memory_order_relaxed);
+    if (!pair_map_future_.valid()) {
+        pair_maps_gpu_ready_ = false;
+        return;
+    }
+    try {
+        (void)pair_map_future_.get();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Pair map worker: %s\n", e.what());
+    }
+    pair_maps_gpu_ready_ = false;
+}
+
+float GpuGrid::pair_map_build_progress() const {
+    if (pair_maps_gpu_ready_)
+        return 1.f;
+    int t = pair_map_build_total_.load(std::memory_order_relaxed);
+    if (t <= 0)
+        return 0.f;
+    int d = pair_map_build_done_.load(std::memory_order_relaxed);
+    float r = float(d) / float(t);
+    return (r > 1.f) ? 1.f : r;
+}
+
+void GpuGrid::start_pair_map_build_async() {
+    discard_pending_pair_map_build();
+    pair_maps_gpu_ready_ = false;
+    const int N = total_;
+    const int nm = params_.num_pair_maps;
+    pair_map_build_done_.store(0, std::memory_order_relaxed);
+    pair_map_build_total_.store(nm, std::memory_order_relaxed);
+    std::vector<unsigned char> wall((size_t)N);
+    CK(cudaMemcpy(wall.data(), fields_.is_wall, N, cudaMemcpyDeviceToHost));
+    SimParams pc = params_;
+    std::atomic<int>* prog = &pair_map_build_done_;
+    pair_map_future_ = std::async(std::launch::async,
+        [wall = std::move(wall), pc, N, nm, prog]() -> std::vector<unsigned char> {
+            std::vector<unsigned char> out((size_t)N * nm, 13);
+            build_pair_map_into(out, wall, pc, nm, prog);
+            return out;
+        });
+}
+
+bool GpuGrid::poll_pair_maps() {
+    if (pair_maps_gpu_ready_)
+        return true;
+    if (!pair_map_future_.valid())
+        return false;
+    if (pair_map_future_.wait_for(std::chrono::seconds(0))
+        != std::future_status::ready)
+        return false;
+    try {
+        h_pair_map_ = pair_map_future_.get();
+        upload_pair_map();
+        pair_maps_gpu_ready_ = true;
+        return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Pair map build failed: %s\n", e.what());
+        pair_maps_gpu_ready_ = false;
+        return false;
+    }
+}
+
+void GpuGrid::wait_pair_maps() {
+    if (pair_maps_gpu_ready_)
+        return;
+    if (!pair_map_future_.valid()) {
+        std::vector<unsigned char> wall((size_t)total_);
+        CK(cudaMemcpy(wall.data(), fields_.is_wall, total_, cudaMemcpyDeviceToHost));
+        int nm = params_.num_pair_maps;
+        h_pair_map_.assign((size_t)total_ * nm, 13);
+        pair_map_build_total_.store(nm, std::memory_order_relaxed);
+        pair_map_build_done_.store(0, std::memory_order_relaxed);
+        build_pair_map_into(h_pair_map_, wall, params_, nm, &pair_map_build_done_);
+        upload_pair_map();
+        pair_maps_gpu_ready_ = true;
+        return;
+    }
+    try {
+        h_pair_map_ = pair_map_future_.get();
+        upload_pair_map();
+        pair_maps_gpu_ready_ = true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Pair map build failed: %s\n", e.what());
+        pair_maps_gpu_ready_ = false;
+    }
+}
+
+void GpuGrid::upload_pair_map() {
+    CK(cudaMemcpy(fields_.pair_map, h_pair_map_.data(),
+                   (size_t)total_ * (size_t)params_.num_pair_maps,
+                   cudaMemcpyHostToDevice));
+}
+
 void GpuGrid::init(const SimParams& p) {
     if (initialized_) free_all();
     params_ = p;
     total_ = p.Nx * p.Ny * p.Nz;
+    params_.num_pair_maps = clamp_num_pair_maps(params_.num_pair_maps);
     params_.t = 0; params_.step_count = 0;
     params_.seed = (unsigned long long)
         std::chrono::high_resolution_clock::now().time_since_epoch().count();
 
     fprintf(stderr, "Init %dx%dx%d  dt=%.5f  eig_lo=%.2f  eig_hi=%.0f (safety cap)\n",
             params_.Nx, params_.Ny, params_.Nz, params_.dt, params_.eig_lo, params_.eig_hi);
-    fprintf(stderr, "  field_kappa=%.1f  beta_scale=%.1f  V_loop=%.3f  Bz=%.1f  E_ref=%.1f  grad_kappa=%.1f  eps=%.3f\n",
-            params_.field_kappa, params_.beta_scale, params_.V_loop, params_.Bz_ext,
+    fprintf(stderr, "  field_kappa=%.1f  V_loop=%.3f  Bz=%.1f  E_ref=%.1f  grad_kappa=%.1f  eps=%.3f\n",
+            params_.field_kappa, params_.V_loop, params_.Bz_ext,
             params_.grad_E_ref, params_.grad_kappa, params_.inv_aspect_ratio);
 
     if (!stream_) CK(cudaStreamCreate(&stream_));
     alloc_all();
     CK(cudaMemset(fields_.is_wall, 0, total_));
     CK(cudaMemset(fields_.wall_E, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.m, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.m_buf, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.q, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.q_buf, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.j_acc_x, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.j_acc_y, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.j_acc_z, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.Jx, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.Jy, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.Jz, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.Ax, 0, total_ * sizeof(float)));
+    CK(cudaMemset(fields_.Ay, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.Az, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.eq_bR, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.eq_bZ, 0, total_ * sizeof(float)));
@@ -276,10 +500,12 @@ void GpuGrid::init(const SimParams& p) {
     if (eq_loaded_ && params_.use_equilibrium)
         upload_equilibrium();
     launch_init_fields(fields_, params_, stream_);
-    // Compute initial b-vector from Bz_ext (B_pol=0 initially, so b along z)
     if (params_.Nz > 1 && params_.field_update_every > 0)
         launch_update_bfield(fields_, params_, stream_);
     CK(cudaStreamSynchronize(stream_));
+
+    start_pair_map_build_async();
+
     initialized_ = true;
 }
 
@@ -291,10 +517,12 @@ void GpuGrid::reset() {
     if (params_.Nz > 1 && params_.field_update_every > 0)
         launch_update_bfield(fields_, params_, stream_);
     CK(cudaStreamSynchronize(stream_));
+    start_pair_map_build_async();
 }
 
 void GpuGrid::swap_buffers() {
     std::swap(fields_.E, fields_.E_buf);
+    std::swap(fields_.m, fields_.m_buf);
     std::swap(fields_.s00, fields_.s00_buf);
     std::swap(fields_.s01, fields_.s01_buf);
     std::swap(fields_.s02, fields_.s02_buf);
@@ -302,23 +530,44 @@ void GpuGrid::swap_buffers() {
     std::swap(fields_.s12, fields_.s12_buf);
     std::swap(fields_.s22, fields_.s22_buf);
     std::swap(fields_.hpow, fields_.hpow_buf);
+    std::swap(fields_.q, fields_.q_buf);
 }
 
 void GpuGrid::step() {
-    // Self-consistent B-field: E → Jz = V_loop·σ(E) → ∇²Az = -Jz → B_pol → b
-    if (params_.Nz > 1 && params_.field_update_every > 0 &&
+    if (!pair_maps_gpu_ready_)
+        return;
+    // j_acc (exchange) → J → ∇²A_i = -J_i → B = curl A + B_ext → eq_b* for transport
+    if (params_.Nz > 1 && params_.field_update_every > 0 && params_.step_count > 0 &&
         params_.step_count % params_.field_update_every == 0) {
-        launch_compute_Jz(fields_, params_, stream_);
+        launch_fill_J_from_charge_accum(fields_, params_, stream_);
         for (int it = 0; it < params_.poisson_iters; it++) {
-            launch_poisson_sor(fields_, params_, 0, stream_);
-            launch_poisson_sor(fields_, params_, 1, stream_);
+            launch_poisson_sor(fields_, params_, 0, fields_.Jx, fields_.Ax, stream_);
+            launch_poisson_sor(fields_, params_, 1, fields_.Jx, fields_.Ax, stream_);
+            launch_poisson_sor(fields_, params_, 0, fields_.Jy, fields_.Ay, stream_);
+            launch_poisson_sor(fields_, params_, 1, fields_.Jy, fields_.Ay, stream_);
+            launch_poisson_sor(fields_, params_, 0, fields_.Jz, fields_.Az, stream_);
+            launch_poisson_sor(fields_, params_, 1, fields_.Jz, fields_.Az, stream_);
         }
         launch_update_bfield(fields_, params_, stream_);
+        launch_clear_j_accum(fields_, params_, stream_);
     }
 
     launch_update_delayed_S(fields_, params_, stream_);
 
-    launch_transport_step(fields_, params_, stream_);
+    // Two-phase: prepare (heating/wall-loss/copy) then pair exchange
+    launch_prepare_step(fields_, params_, stream_);
+
+    // Random map slot; z-shift for overlay (periodic z only, matches pair_map build)
+    thread_local std::mt19937 map_rng(std::random_device{}());
+    int nm = params_.num_pair_maps;
+    std::uniform_int_distribution<int> dslot(0, nm - 1);
+    int map_slot = dslot(map_rng);
+    int shift_z = 0;
+    if (params_.Nz > 1 && params_.wall_z_periodic) {
+        std::uniform_int_distribution<int> dsz(0, params_.Nz - 1);
+        shift_z = dsz(map_rng);
+    }
+    launch_exchange(fields_, params_, shift_z, map_slot, nm, stream_);
 
     launch_tensor_step(fields_, params_, stream_);
     swap_buffers();
@@ -334,12 +583,16 @@ void GpuGrid::readback() {
     launch_readback(fields_, params_, stream_);
     int n = total_;
     CK(cudaMemcpyAsync(h_E_.data(),         fields_.rb_E,         n*4, cudaMemcpyDeviceToHost, stream_));
+    CK(cudaMemcpyAsync(h_mass_.data(),     fields_.rb_mass,     n*4, cudaMemcpyDeviceToHost, stream_));
     CK(cudaMemcpyAsync(h_aniso_.data(),     fields_.rb_aniso,     n*4, cudaMemcpyDeviceToHost, stream_));
     CK(cudaMemcpyAsync(h_aniso_angle_.data(),fields_.rb_aniso_angle,n*4, cudaMemcpyDeviceToHost, stream_));
     CK(cudaMemcpyAsync(h_wall_flux_.data(), fields_.rb_wall_flux, n*4, cudaMemcpyDeviceToHost, stream_));
     CK(cudaMemcpyAsync(h_wall_E_.data(),    fields_.wall_E,      n*4, cudaMemcpyDeviceToHost, stream_));
     CK(cudaMemcpyAsync(h_gradE_sq_.data(),  fields_.rb_gradE_sq,  n*4, cudaMemcpyDeviceToHost, stream_));
     CK(cudaMemcpyAsync(h_psi_norm_.data(), fields_.rb_psi_norm,  n*4, cudaMemcpyDeviceToHost, stream_));
+    CK(cudaMemcpyAsync(h_J_mag_.data(),    fields_.rb_J_mag,     n*4, cudaMemcpyDeviceToHost, stream_));
+    CK(cudaMemcpyAsync(h_B_mag_.data(),    fields_.rb_B_mag,     n*4, cudaMemcpyDeviceToHost, stream_));
+    CK(cudaMemcpyAsync(h_J_vis_.data(),    fields_.rb_J_vis,      (size_t)n * 3u * sizeof(float), cudaMemcpyDeviceToHost, stream_));
     CK(cudaStreamSynchronize(stream_));
 }
 
@@ -382,7 +635,7 @@ void GpuGrid::finalize_metrics() {
 // ============================================================
 SimParams default_sim_params() {
     SimParams p{};
-    p.Nx = 128; p.Ny = 128; p.Nz = 1;
+    p.Nx = 128; p.Ny = 128; p.Nz = 32;
     p.dt = 0.005f;
 
     p.eig_lo = 0.1f; p.eig_hi = 1000.0f;
@@ -411,16 +664,17 @@ SimParams default_sim_params() {
     p.seed = 42;
     p.t = 0; p.step_count = 0;
 
-    p.gamma_rad = 0.001f;
-    p.rad_exp = 1.5f;
+    p.cord_radius = 0.8f;
+    p.cord_mass = 1.0f;
+    p.m0 = 0.5f;
+    p.m_ref = 1.0f;
+    p.alpha_m = 1.0f;
 
     p.wall_cooling = 2.0f;
     p.wall_E_max = 100.0f;
+    p.wall_sink_E_gain = 45.0f;
 
     p.beta_limit = 150.0f;
-
-    p.omega_base = 0.0f;
-    p.omega_r_power = 0.0f;
 
     p.use_equilibrium = 0;
     p.chi_parallel = 100.0f;
@@ -433,8 +687,12 @@ SimParams default_sim_params() {
     p.field_update_every = 0;  // disabled by default
     p.sor_omega = 1.7f;
     p.field_kappa = 1.0f;
-    p.beta_scale = 10.0f;
     p.inv_aspect_ratio = 0.0f;
+
+    p.charge_mass_scale = 1.0f;
+    p.charge_R0 = 1e-4f;
+    // ~1 after geometry: j_acc is O(q); denom fe*dt*dx^2 is O(1e-6) on 128^2 grid → start near 1e-3
+    p.charge_j_scale = 1e-3f;
 
     p.n_beams = 0;
     p.beam_sigma_r = 0.03f;
@@ -443,6 +701,8 @@ SimParams default_sim_params() {
     p.beam_r0 = 0.15f;
 
     p.heat_E_abs = 0.0f;
+
+    p.num_pair_maps = 32;
 
     return p;
 }
@@ -468,6 +728,7 @@ SimParams load_sim_params(const std::string& path) {
     G("grid","wall_radius",wall_radius);
     G("grid","tube_length",tube_length);
     GI("grid","wall_z_periodic",wall_z_periodic);
+    GI("grid","num_pair_maps",num_pair_maps);
     G("grid","g_noise_init",g_noise_init);
     if (c["grid"]&&c["grid"]["heat_profile"]) {
         auto h = c["grid"]["heat_profile"];
@@ -507,16 +768,24 @@ SimParams load_sim_params(const std::string& path) {
 
     if (c["seed"]) p.seed = c["seed"].as<unsigned long long>();
 
-    G("radiation","gamma_rad",gamma_rad);
-    G("radiation","rad_exp",rad_exp);
+    if (c["omega"]) {
+        fprintf(stderr,
+                "Warning: config section 'omega' is ignored (removed); delete it from YAML.\n");
+    }
+
+    if (c["medium"]) {
+        G("medium","cord_radius",cord_radius);
+        G("medium","cord_mass",cord_mass);
+        G("medium","m0",m0);
+        G("medium","m_ref",m_ref);
+        G("medium","alpha_m",alpha_m);
+    }
 
     G("wall","cooling",wall_cooling);
     G("wall","E_max",wall_E_max);
+    G("wall","sink_E_gain",wall_sink_E_gain);
 
     G("beta","limit",beta_limit);
-
-    G("omega","base",omega_base);
-    G("omega","r_power",omega_r_power);
 
     if (c["equilibrium"]) {
         auto eq = c["equilibrium"];
@@ -533,8 +802,13 @@ SimParams load_sim_params(const std::string& path) {
         GI("field","update_every",field_update_every);
         G("field","sor_omega",sor_omega);
         G("field","kappa",field_kappa);
-        G("field","beta_scale",beta_scale);
         G("field","inv_aspect_ratio",inv_aspect_ratio);
+    }
+    if (c["charge"]) {
+        auto ch = c["charge"];
+        if (ch["mass_scale"]) p.charge_mass_scale = ch["mass_scale"].as<float>();
+        if (ch["R0"]) p.charge_R0 = ch["R0"].as<float>();
+        if (ch["j_scale"]) p.charge_j_scale = ch["j_scale"].as<float>();
     }
 
     if (c["beams"]) {
