@@ -53,6 +53,12 @@ struct GridFieldsPtrs {
     // Kawasaki pair map (one byte per cell: direction code, 13 = no pair)
     unsigned char *pair_map;
 
+    // Single float: atomicAdd Σ|dq| (plasma→wall) between GpuGrid drain snapshots
+    float *wall_q_sink_accum;
+
+    // Step total radiation energy (plasma → wall); cleared at start of prepare, then accumulated
+    float *rad_step_accum;
+
     // Readback buffers (device-side staging for D2H copy)
     float *rb_E;
     float *rb_mass;
@@ -64,6 +70,7 @@ struct GridFieldsPtrs {
     float *rb_J_mag;       // |J| after Poisson (from j_acc), volume viz
     float *rb_B_mag;       // |B| from eq_bR/Z/Phi (curl A + B_ext), volume viz
     float *rb_J_vis;       // 3*n: rg=0.5±0.5*Jx/|J|, ba same Jy, b=|J| (RGB volume viz)
+    float *rb_charge;      // plasma q (charge proxy), 3D volume viz
 };
 
 // ---- Global metrics (reduced on GPU) ----
@@ -85,6 +92,8 @@ struct GlobalMetrics {
 
     // Emergent current
     float Ip_total;           // ∫ J·ẑ dA (uses Jz) — toroidal current proxy
+    // Σ|Δq| plasma→wall this sim step (atomic accum); host-patched in GpuGrid::sync
+    float wall_q_sink_step;
 
     // Region counts
     int   n_interior;
@@ -102,6 +111,12 @@ void launch_prepare_step(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s =
 void launch_exchange(GridFieldsPtrs& f, const SimParams& p,
                      int shift_z, int map_slot, int num_maps,
                      cudaStream_t s = 0);
+/// Sum plasma m_buf into *d_out (double, must be zeroed before); block reduction + atomicAdd.
+void launch_mass_sum_plasma_mbuf(GridFieldsPtrs& f, const SimParams& p, double* d_out,
+                                 cudaStream_t s = 0);
+/// Scale non-wall m_buf,q_buf by (*d_sum_ref)/(*d_sum_cur) (FP mass conservation).
+void launch_apply_mass_fp_fix(GridFieldsPtrs& f, const SimParams& p,
+                              double* d_sum_ref, double* d_sum_cur, cudaStream_t s = 0);
 void launch_tensor_step(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 void launch_readback(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 void launch_compute_metrics(GridFieldsPtrs& f, const SimParams& p,

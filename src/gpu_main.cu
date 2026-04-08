@@ -19,20 +19,50 @@
 #include <string>
 #include <fstream>
 
-// ---- Color maps ----
-static ImU32 viridis(float v) {
-    v = fminf(fmaxf(v, 0.0f), 1.0f);
-    float r = fminf(fmaxf(-0.67f+4.65f*v-6.2f*v*v+3.22f*v*v*v, 0.0f), 1.0f);
-    float g = fminf(fmaxf(0.01f+1.3f*v-0.76f*v*v, 0.0f), 1.0f);
-    float b = fminf(fmaxf(0.34f+0.87f*v-2.4f*v*v+1.6f*v*v*v, 0.0f), 1.0f);
-    return IM_COL32((int)(r*255),(int)(g*255),(int)(b*255),255);
-}
+// ---- Color maps (no cyan/blue lows: black → red → yellow → white) ----
 static ImU32 hot(float v) {
     v = fminf(fmaxf(v, 0.0f), 1.0f);
     float r = fminf(v*3.0f, 1.0f);
     float g = fminf(fmaxf((v-0.33f)*3.0f, 0.0f), 1.0f);
     float b = fminf(fmaxf((v-0.67f)*3.0f, 0.0f), 1.0f);
     return IM_COL32((int)(r*255),(int)(g*255),(int)(b*255),255);
+}
+// Signed charge: t in [0,1], t=0.5 → q=0. Max negative → deep red; neutral → black; positive → white.
+static ImU32 charge_signed_rbkw(float t) {
+    t = fminf(fmaxf(t, 0.0f), 1.0f);
+    float r, g, b;
+    if (t <= 0.5f) {
+        float u = 1.0f - t * 2.0f;
+        r = 0.02f + 0.93f * u;
+        g = 0.02f * u;
+        b = 0.02f * u;
+    } else {
+        float u = (t - 0.5f) * 2.0f;
+        r = 0.02f + 0.98f * u;
+        g = 0.02f + 0.98f * u;
+        b = 0.02f + 0.98f * u;
+    }
+    return IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
+}
+
+// Mass viz tuning (sliders in Controls); ln map vs peak, then γ>1 to tame bright top (hot colormap)
+static float g_mass_viz_floor_frac = 3e-6f;
+static float g_mass_viz_gamma = 1.22f;
+// Charge 2D + 3D: |q| / (max|q| in plasma * this) before clamp → full rbkw / TF (otherwise almost all cells sit at q≈0 → black).
+static float g_charge_viz_peak_frac = 0.032f;
+// After linear scale, γ<1 lifts mid-range |q| away from neutral black.
+static float g_charge_viz_gamma = 0.78f;
+
+static float mass_viz_norm_log(float m, float linear_hi) {
+    float hi = fmaxf(linear_hi, 1e-20f);
+    float base = fmaxf(hi * g_mass_viz_floor_frac, 1e-18f);
+    float u = logf(fmaxf(m, 0.f) + base);
+    float u0 = logf(base);
+    float u1 = logf(hi + base);
+    float t = (u - u0) / fmaxf(u1 - u0, 1e-20f);
+    t = fminf(fmaxf(t, 0.f), 1.f);
+    t = powf(t, g_mass_viz_gamma);
+    return fminf(fmaxf(t, 0.f), 1.f);
 }
 
 struct DisruptionTracker {
@@ -154,9 +184,11 @@ struct TimeSeries {
     std::vector<float> mean_aniso, barrier_aniso;
     std::vector<float> wall_flux, wall_T_peak, radiation;
     std::vector<float> confinement, total_mass;
+    std::vector<float> wall_q_sink;
+    std::vector<float> ip_vol;
     int max_len;
     TimeSeries(int ml = 4000) : max_len(ml) {}
-    void push(float time, const GlobalMetrics& m) {
+    void push(float time, const GlobalMetrics& m, int Nz) {
         auto ap = [&](std::vector<float>& d, float v) {
             d.push_back(v);
             if ((int)d.size() > max_len)
@@ -173,6 +205,9 @@ struct TimeSeries {
         ap(radiation, m.total_radiation);
         ap(confinement, m.confinement);
         ap(total_mass, m.total_mass);
+        // Σ|Δq| to wall this step (no window average)
+        ap(wall_q_sink, m.wall_q_sink_step);
+        ap(ip_vol, m.Ip_total / fmaxf((float)Nz, 1.0f));
     }
 };
 
@@ -233,8 +268,10 @@ static void draw_aniso_dir(const char* label, const float* aniso, const float* a
         float a = aniso[si*Ny+sj];
         float th = angle[si*Ny+sj];
         float mag = fminf(a / fmaxf(max_aniso, 0.01f), 1.0f);
-        float hue = (th / 3.14159f) + 0.5f;
-        if (hue < 0) hue += 1.0f; if (hue > 1.0f) hue -= 1.0f;
+        float hue = ((th / 3.14159f) + 0.5f);
+        if (hue < 0) hue += 1.0f;
+        if (hue > 1.0f) hue -= 1.0f;
+        hue *= 0.45f;
         ImU32 col = hsv_to_col(hue, 1.0f, mag);
         float x0 = p0.x + mi*cs, y0 = p0.y + mj*cs;
         dl->AddRectFilled(ImVec2(x0,y0), ImVec2(x0+cs+1,y0+cs+1), col);
@@ -301,7 +338,7 @@ uniform vec3 uBoxMax;
 uniform float uWallRadius;
 uniform float uWallAlpha;
 uniform int uColorMode;     // 0 scalar volume, 1 RGB J (dir in rg, |J| in b)
-uniform int uScalarTfMode; // 0 sample uTFTex (hot), 1 blue→white by scalar (for |J|)
+uniform int uScalarTfMode; // 0 all scalars: same 1D TF as Energy; 2 charge: TF(|q−neutral|) + sign tint
 
 vec3 hsv2rgb_vol(float h, float s, float v) {
     vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
@@ -320,6 +357,33 @@ vec2 intersect_box(vec3 orig, vec3 dir, vec3 bmin, vec3 bmax) {
     return vec2(tnear, tfar);
 }
 
+// ∂s/∂x in world units; N points toward increasing scalar (out of "fog" denser regions).
+float scalarDiffuseShade(vec3 tc, vec3 boxSize, vec3 lightDir) {
+    ivec3 isz = textureSize(uVolTex, 0);
+    vec3 e = 1.0 / vec3(max(isz, ivec3(1)));
+    vec3 pad = e * 2.0;
+    vec3 c = clamp(tc, pad, 1.0 - pad);
+    float sxp = texture(uVolTex, c + vec3(e.x, 0.0, 0.0)).r;
+    float sxm = texture(uVolTex, c - vec3(e.x, 0.0, 0.0)).r;
+    float syp = texture(uVolTex, c + vec3(0.0, e.y, 0.0)).r;
+    float sym = texture(uVolTex, c - vec3(0.0, e.y, 0.0)).r;
+    float szp = texture(uVolTex, c + vec3(0.0, 0.0, e.z)).r;
+    float szm = texture(uVolTex, c - vec3(0.0, 0.0, e.z)).r;
+    vec3 gW = vec3(
+        (sxp - sxm) / (2.0 * e.x * max(boxSize.x, 1e-6)),
+        (syp - sym) / (2.0 * e.y * max(boxSize.y, 1e-6)),
+        (szp - szm) / (2.0 * e.z * max(boxSize.z, 1e-6))
+    );
+    float gm = length(gW);
+    if (gm < 1e-10)
+        return 1.0;
+    vec3 N = gW / gm;
+    float ndl = max(0.0, dot(N, lightDir));
+    float wrap = 0.42;
+    float diff = clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
+    return 0.30 + 0.70 * diff;
+}
+
 void main() {
     vec2 ndc = vUV * 2.0 - 1.0;
     vec4 near4 = uMVPInv * vec4(ndc, -1.0, 1.0);
@@ -336,22 +400,27 @@ void main() {
     vec3  boxSize   = uBoxMax - uBoxMin;
     float range_inv = 1.0 / max(uHi - uLo, 1e-8);
     vec4  acc = vec4(0.0);
+    vec3  volLightDir = normalize(vec3(0.48, 0.82, 0.32));
+    vec3  fillLight   = normalize(vec3(-0.55, 0.35, -0.76));
 
     for (float d = t.x; d < t.y; d += uStepSize) {
         vec3 p  = rayOrig + rayDir * d;
         vec3 tc = (p - uBoxMin) / boxSize;
 
-        // Tube wall: cylindrical shell at wall_radius from center (0.5, 0.5)
+        // Tube wall: thin bright shell (low α so plasma stays visible through it).
         if (uWallRadius > 0.0 && uWallAlpha > 0.0) {
             float wx = tc.x - 0.5;
             float wy = tc.y - 0.5;
             float r = sqrt(wx*wx + wy*wy);
             float dr = abs(r - uWallRadius);
-            if (dr < 0.015) {
-                float wall_a = uWallAlpha * (1.0 - dr / 0.015) * uStepSize * 30.0;
+            float shell = 0.012;
+            if (dr < shell) {
+                float rim = (1.0 - dr / shell);
+                float wall_a = uWallAlpha * rim * uStepSize * 11.0;
                 if (uColorMode != 0)
                     wall_a *= 0.22;
-                vec3 wall_col = vec3(0.3, 0.5, 0.7);
+                vec3 wall_col = vec3(0.62, 0.64, 0.70);
+                wall_a *= 0.55;
                 acc.rgb += (1.0 - acc.a) * wall_a * wall_col;
                 acc.a   += (1.0 - acc.a) * wall_a;
             }
@@ -365,26 +434,68 @@ void main() {
             float jm = t4.b;
             float nv = clamp((jm - uLo) * range_inv, 0.0, 1.0);
             float jxy = length(dir);
-            float hue = (jxy > 0.03) ? (atan(dir.y, dir.x) * 0.159154943 + 0.5) : 0.0;
+            float hue01 = (jxy > 0.03) ? fract(atan(dir.y, dir.x) * 0.159161972 + 0.5) : 0.0;
+            float hue = hue01 * 0.45;
             float sat = min(1.0, jxy * 1.65);
-            float val = 0.2 + 0.8 * pow(max(nv, 0.0), 0.75);
+            float val = 0.38 + 0.62 * pow(max(nv, 0.0), 0.68);
             samp_rgb = hsv2rgb_vol(hue, sat, val);
-            samp_a = 0.025 + 0.38 * nv * (0.4 + 0.6 * min(1.0, jxy * 1.8));
-        } else if (uScalarTfMode != 0) {
-            float nv = clamp((t4.r - uLo) * range_inv, 0.0, 1.0);
-            float nt = pow(max(nv, 0.0), 0.82);
-            vec3 coldJ = vec3(0.03, 0.07, 0.38);
-            vec3 hotJ  = vec3(1.0, 1.0, 1.0);
-            samp_rgb = mix(coldJ, hotJ, nt);
-            samp_a = 0.06 + 0.52 * nv;
+            samp_a = 0.038 + 0.45 * nv * (0.45 + 0.55 * min(1.0, jxy * 1.8));
+        } else if (uScalarTfMode == 2) {
+            float s = clamp(t4.r, 0.0, 1.0);
+            float dq = abs(s - 0.5) * 2.0;
+            // Data already peak-scaled on CPU; extra lift on TF coord helps mids stay visible.
+            float u_tf = clamp(pow(max(dq, 0.0), 0.88), 0.0, 1.0);
+            vec4 c = texture(uTFTex, u_tf);
+            float a_tf = c.a;
+            samp_a = max(a_tf * 0.85, 0.075 + 0.48 * pow(max(dq, 0.0), 0.72));
+            samp_rgb = c.rgb * (1.10 + 0.42 * dq);
+            if (s <= 0.5)
+                samp_rgb *= vec3(1.12, 0.36, 0.32);
         } else {
             float nv = clamp((t4.r - uLo) * range_inv, 0.0, 1.0);
             vec4 c = texture(uTFTex, nv);
             samp_rgb = c.rgb;
             samp_a = c.a;
         }
-        float stepBoost = (uColorMode != 0) ? 22.0 : 48.0;
+        if (uColorMode == 0) {
+            float sh1 = scalarDiffuseShade(tc, boxSize, volLightDir);
+            float sh2 = scalarDiffuseShade(tc, boxSize, fillLight);
+            float sh = sh1 * 0.72 + sh2 * 0.28;
+            if (uScalarTfMode != 2)
+                sh = mix(1.0, sh, 0.48);
+            else
+                sh = mix(1.0, sh, 0.26);
+            samp_rgb *= sh;
+        } else {
+            float jm = t4.b;
+            float nvj = clamp((jm - uLo) * range_inv, 0.0, 1.0);
+            vec2 dir = (t4.rg - 0.5) * 2.0;
+            float jxy = length(dir);
+            if (nvj > 0.04 && jxy > 0.02) {
+                ivec3 isz = textureSize(uVolTex, 0);
+                vec3 e = 1.0 / vec3(max(isz, ivec3(1)));
+                vec3 pad = e * 2.0;
+                vec3 cj = clamp(tc, pad, 1.0 - pad);
+                float jp = texture(uVolTex, cj + vec3(e.x, 0.0, 0.0)).b;
+                float jmx = texture(uVolTex, cj - vec3(e.x, 0.0, 0.0)).b;
+                float gx = (jp - jmx) / (2.0 * e.x * max(boxSize.x, 1e-6));
+                float gy = (texture(uVolTex, cj + vec3(0.0, e.y, 0.0)).b - texture(uVolTex, cj - vec3(0.0, e.y, 0.0)).b)
+                         / (2.0 * e.y * max(boxSize.y, 1e-6));
+                float gz = (texture(uVolTex, cj + vec3(0.0, 0.0, e.z)).b - texture(uVolTex, cj - vec3(0.0, 0.0, e.z)).b)
+                         / (2.0 * e.z * max(boxSize.z, 1e-6));
+                vec3 gJ = vec3(gx, gy, gz);
+                float gjn = length(gJ);
+                if (gjn > 1e-8) {
+                    float ndl = max(0.0, dot(gJ / gjn, volLightDir));
+                    float rim = 0.2 + 0.8 * pow(ndl, 0.65);
+                    samp_rgb *= (0.45 + 0.55 * rim);
+                }
+            }
+        }
+        float stepBoost = (uColorMode != 0) ? 22.0 : ((uScalarTfMode == 2) ? 38.0 : 48.0);
         float a = samp_a * uOpacity * uStepSize * stepBoost;
+        if (uColorMode == 0 && uScalarTfMode == 2)
+            a *= 0.68;
         acc.rgb += (1.0 - acc.a) * a * samp_rgb;
         acc.a   += (1.0 - acc.a) * a;
         if (acc.a > 0.95) break;
@@ -474,9 +585,9 @@ struct VolumeRenderer {
         unsigned char tf[256 * 4];
         for (int i = 0; i < 256; i++) {
             float v = i / 255.0f;
-            float r = fminf(fmaxf(-0.67f+4.65f*v-6.2f*v*v+3.22f*v*v*v, 0.0f), 1.0f);
-            float g = fminf(fmaxf(0.01f+1.3f*v-0.76f*v*v, 0.0f), 1.0f);
-            float b = fminf(fmaxf(0.34f+0.87f*v-2.4f*v*v+1.6f*v*v*v, 0.0f), 1.0f);
+            float r = fminf(v * 3.0f, 1.0f);
+            float g = fminf(fmaxf((v - 0.33f) * 3.0f, 0.0f), 1.0f);
+            float b = fminf(fmaxf((v - 0.67f) * 3.0f, 0.0f), 1.0f);
             float a = v * v;
             tf[i*4+0] = (unsigned char)(r*255);
             tf[i*4+1] = (unsigned char)(g*255);
@@ -573,7 +684,7 @@ struct VolumeRenderer {
 
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glViewport(0, 0, w, h);
-        glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glUseProgram(prog);
@@ -624,10 +735,15 @@ struct VolumeRenderer {
 // ============================================================
 static void draw_heatmap_slice(const char* label, const float* data,
                                int Nx, int Ny, int Nz, int z_slice,
-                               ImU32 (*cmap)(float), float lo, float hi, float sz) {
-    ImGui::BeginChild(label, ImVec2(sz+20, sz+44), true);
+                               ImU32 (*cmap)(float), float lo, float hi, float sz,
+                               bool mass_log_scale = false) {
+    ImGui::BeginChild(label, ImVec2(sz+20, sz+52), true);
     ImGui::Text("%s  z=%d/%d", label, z_slice, Nz);
-    ImGui::TextColored(ImVec4(0.65f, 0.75f, 0.95f, 1.f), "colormap [%.3g, %.3g]", (double)lo, (double)hi);
+    ImVec4 cap_col(0.78f, 0.78f, 0.80f, 1.f);
+    if (mass_log_scale)
+        ImGui::TextColored(cap_col, "hot (log ln)  sparse→dark  m_peak≈%.3g", (double)hi);
+    else
+        ImGui::TextColored(cap_col, "colormap [%.3g, %.3g]", (double)lo, (double)hi);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
 
     int step = 1;
@@ -642,10 +758,71 @@ static void draw_heatmap_slice(const char* label, const float* data,
     for (int mi = 0; mi < mapW; ++mi)
     for (int mj = 0; mj < mapH; ++mj) {
         int si = mi*step, sj = mj*step;
-        float v = (data[(si * Ny + sj) * Nz + zk] - lo) / range;
+        float raw = data[(si * Ny + sj) * Nz + zk];
+        float v = mass_log_scale ? mass_viz_norm_log(raw, hi)
+                                 : (raw - lo) / range;
         ImU32 col = cmap(v);
         float x0 = p0.x + mi*cs, y0 = p0.y + mj*cs;
         dl->AddRectFilled(ImVec2(x0,y0), ImVec2(x0+cs+1,y0+cs+1), col);
+    }
+    ImGui::Dummy(ImVec2(sz, sz));
+    ImGui::EndChild();
+}
+
+/// Plasma-only charge slice: vacuum black; plasma red←black→white (t=0.5 is q=0).
+static void draw_charge_slice(const char* label, const float* q, const float* m,
+                              int Nx, int Ny, int Nz, int z_slice, float sz) {
+    int zk = (Nz <= 1) ? 0 : std::max(0, std::min(z_slice, Nz - 1));
+    int nt = Nx * Ny * Nz;
+    float m_peak = 0.f;
+    for (int i = 0; i < nt; ++i)
+        m_peak = fmaxf(m_peak, m[i]);
+    float m_cut = fmaxf(m_peak * 1e-6f, 1e-14f);
+    float qa = 0.f;
+    for (int i = 0; i < nt; ++i) {
+        if (m[i] < m_cut) continue;
+        qa = fmaxf(qa, fabsf(q[i]));
+    }
+    float q_ref = fmaxf(qa * g_charge_viz_peak_frac, 1e-30f);
+
+    ImGui::BeginChild(label, ImVec2(sz + 20, sz + 52), true);
+    if (Nz > 1)
+        ImGui::Text("%s  z=%d/%d", label, zk, Nz);
+    else
+        ImGui::Text("%s", label);
+    char cap[144];
+    std::snprintf(cap, sizeof(cap),
+                  "plasma  peak|q|≈%.3g  full scale≈%.3g  (red←0→white)",
+                  (double)qa, (double)q_ref);
+    ImGui::TextColored(ImVec4(0.78f, 0.78f, 0.80f, 1.f), "%s", cap);
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+
+    int step = 1;
+    int mapW = Nx, mapH = Ny;
+    if (Nx > 512) { step = (Nx + 511) / 512; mapW = Nx / step; mapH = Ny / step; }
+
+    float cs = sz / fmaxf(mapW, mapH);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 vac_col = IM_COL32(0, 0, 0, 255);
+
+    for (int mi = 0; mi < mapW; ++mi)
+    for (int mj = 0; mj < mapH; ++mj) {
+        int si = mi * step, sj = mj * step;
+        int idx = (si * Ny + sj) * Nz + zk;
+        ImU32 col;
+        if (m[idx] < m_cut)
+            col = vac_col;
+        else {
+            float z = q[idx] / q_ref;
+            z = fminf(fmaxf(z, -1.f), 1.f);
+            float az = powf(fabsf(z), g_charge_viz_gamma);
+            z = (z >= 0.f) ? az : -az;
+            float t = 0.5f + 0.5f * z;
+            t = fminf(fmaxf(t, 0.f), 1.f);
+            col = charge_signed_rbkw(t);
+        }
+        float x0 = p0.x + mi * cs, y0 = p0.y + mj * cs;
+        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + cs + 1, y0 + cs + 1), col);
     }
     ImGui::Dummy(ImVec2(sz, sz));
     ImGui::EndChild();
@@ -666,6 +843,33 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImPlot::CreateContext();
     ImGui::StyleColorsDark();
+    {
+        ImGuiStyle& st = ImGui::GetStyle();
+        ImVec4 blk(0.f, 0.f, 0.f, 1.f);
+        ImVec4 blk_h(0.04f, 0.04f, 0.04f, 1.f);
+        st.Colors[ImGuiCol_WindowBg]  = blk;
+        st.Colors[ImGuiCol_ChildBg]   = blk;
+        st.Colors[ImGuiCol_MenuBarBg] = blk;
+        st.Colors[ImGuiCol_TitleBg]        = blk_h;
+        st.Colors[ImGuiCol_TitleBgActive]  = blk_h;
+        st.Colors[ImGuiCol_TitleBgCollapsed] = blk_h;
+        st.Colors[ImGuiCol_ScrollbarBg]    = blk_h;
+        st.Colors[ImGuiCol_FrameBg]        = ImVec4(0.10f, 0.10f, 0.11f, 1.f);
+        st.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.14f, 0.14f, 0.16f, 1.f);
+        st.Colors[ImGuiCol_FrameBgActive]  = ImVec4(0.18f, 0.18f, 0.20f, 1.f);
+        st.Colors[ImGuiCol_PopupBg]        = ImVec4(0.06f, 0.06f, 0.06f, 1.f);
+        st.Colors[ImGuiCol_Border]         = ImVec4(0.22f, 0.22f, 0.24f, 1.f);
+        st.Colors[ImGuiCol_Tab]            = blk_h;
+        st.Colors[ImGuiCol_TabHovered]     = ImVec4(0.12f, 0.12f, 0.14f, 1.f);
+        st.Colors[ImGuiCol_TabActive]      = ImVec4(0.16f, 0.16f, 0.18f, 1.f);
+        st.Colors[ImGuiCol_TabUnfocused]   = blk_h;
+        st.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.14f, 0.14f, 0.16f, 1.f);
+    }
+    ImPlot::GetStyle().Colors[ImPlotCol_PlotBg]    = ImVec4(0, 0, 0, 1);
+    ImPlot::GetStyle().Colors[ImPlotCol_FrameBg]  = ImVec4(0, 0, 0, 1);
+    ImPlot::GetStyle().Colors[ImPlotCol_PlotBorder] = ImVec4(0.28f, 0.28f, 0.30f, 1);
+    ImPlot::GetStyle().Colors[ImPlotCol_LegendBg] = ImVec4(0.05f, 0.05f, 0.05f, 0.92f);
+
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
@@ -723,25 +927,28 @@ int main(int argc, char** argv) {
     int readback_every = 2;
     int frame_counter = 0;
     float map_size = 250.0f;
-    int active_map = 0;
     float E_scale = 5.0f;
     float aniso_scale = 5.0f;
     float gradE_scale = 100.0f;
     bool auto_scale = true;
 
     OrbitCamera orbit_cam;
-    float vol_opacity = 1.5f;
+    float vol_opacity = 0.95f;
     float vol_E_max = 10.0f;
     bool  vol_use_map_E_scale = false;
-    float wall_tube_alpha = 0.3f;
+    float wall_tube_alpha = 0.22f;
     bool  show_3d = true;
-    int   vol_data_mode = 0;  // 0=E, 1=m, 2=E/m, 3=|J| blue-white, 4=|B|, 5=J RGB+dir
+    int   vol_data_mode = 0;  // 0=E, 1=m, 2=E/m, 3=|J|, 4=charge q
     float vol_em_max = 15.0f; // upper scale for 3D E/m mode
     float vol_J_max = 5.0f;
-    float vol_B_max = 15.0f;
+    // Zero voxels with |J| < cut * max(|J|) in frame; colormap still uses Vol |J| max (no rescale).
+    float vol_J_low_cut = 0.f;
     int   z_slice = 0;
     int   vol_display_nz = 32;
     std::vector<float> vol_em_;
+    std::vector<float> mass_vol_norm_;
+    std::vector<float> vol_J_filtered_;
+    std::vector<float> vol_charge_vis_;
 
     bool  mass_viz_autoscale = true;
     float mass_col_hi = 1.0f;
@@ -765,7 +972,7 @@ int main(int argc, char** argv) {
             grid.sync();
             grid.finalize_metrics();
             const auto& m = grid.metrics();
-            ts.push(grid.t(), m);
+            ts.push(grid.t(), m, grid.Nz());
             dtrack.update(m, grid.params().dt * steps_per_frame, steps_per_frame);
 
             if (dtrack.hard_disruption && !paused) {
@@ -789,11 +996,21 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (!mass_viz_autoscale)
+            mass_col_hi = fmaxf(mass_col_manual_max, 1e-10f);
+
         if (show_3d) {
             const float* vol_src = grid.h_E();
             int vol_tex_ch = 1;
             if (vol_data_mode == 1) {
-                vol_src = grid.h_mass();
+                int nt = Nx * Ny * Nz;
+                if ((int)mass_vol_norm_.size() != nt)
+                    mass_vol_norm_.resize((size_t)nt);
+                const float* hm = grid.h_mass();
+                float hic = mass_col_hi;
+                for (int i = 0; i < nt; ++i)
+                    mass_vol_norm_[i] = mass_viz_norm_log(hm[i], hic);
+                vol_src = mass_vol_norm_.data();
             } else if (vol_data_mode == 2) {
                 int nt = Nx * Ny * Nz;
                 if ((int)vol_em_.size() != nt)
@@ -804,12 +1021,50 @@ int main(int argc, char** argv) {
                     vol_em_[i] = he[i] / fmaxf(hm[i], 1e-8f);
                 vol_src = vol_em_.data();
             } else if (vol_data_mode == 3 && Nz > 1) {
-                vol_src = grid.h_J_mag();
+                const float* jm = grid.h_J_mag();
+                int nt = Nx * Ny * Nz;
+                if (vol_J_low_cut <= 0.f) {
+                    vol_src = jm;
+                } else {
+                    if ((int)vol_J_filtered_.size() != nt)
+                        vol_J_filtered_.resize((size_t)nt);
+                    float jmax = 0.f;
+                    for (int i = 0; i < nt; ++i)
+                        jmax = fmaxf(jmax, jm[i]);
+                    float thr = vol_J_low_cut * jmax;
+                    for (int i = 0; i < nt; ++i)
+                        vol_J_filtered_[i] = (jm[i] >= thr) ? jm[i] : 0.f;
+                    vol_src = vol_J_filtered_.data();
+                }
             } else if (vol_data_mode == 4 && Nz > 1) {
-                vol_src = grid.h_B_mag();
-            } else if (vol_data_mode == 5 && Nz > 1) {
-                vol_src = grid.h_J_vis();
-                vol_tex_ch = 3;
+                const float* hq = grid.h_q();
+                const float* hm = grid.h_mass();
+                int nt = Nx * Ny * Nz;
+                if ((int)vol_charge_vis_.size() != nt)
+                    vol_charge_vis_.resize((size_t)nt);
+                float m_peak = 0.f;
+                for (int i = 0; i < nt; ++i)
+                    m_peak = fmaxf(m_peak, hm[i]);
+                float m_cut = fmaxf(m_peak * 1e-6f, 1e-14f);
+                float qa = 0.f;
+                for (int i = 0; i < nt; ++i) {
+                    if (hm[i] < m_cut) continue;
+                    qa = fmaxf(qa, fabsf(hq[i]));
+                }
+                float q_ref = fmaxf(qa * g_charge_viz_peak_frac, 1e-30f);
+                float gcg = g_charge_viz_gamma;
+                for (int i = 0; i < nt; ++i) {
+                    if (hm[i] < m_cut) {
+                        vol_charge_vis_[i] = 0.5f;
+                        continue;
+                    }
+                    float z = hq[i] / q_ref;
+                    z = fminf(fmaxf(z, -1.f), 1.f);
+                    float az = powf(fabsf(z), gcg);
+                    z = (z >= 0.f) ? az : -az;
+                    vol_charge_vis_[i] = fminf(fmaxf(0.5f + 0.5f * z, 0.f), 1.f);
+                }
+                vol_src = vol_charge_vis_.data();
             }
             vol_renderer.update_volume(vol_src, Nx, Ny, Nz,
                                        (Nz == 1) ? vol_display_nz : 0,
@@ -819,9 +1074,6 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-
-        if (!mass_viz_autoscale)
-            mass_col_hi = fmaxf(mass_col_manual_max, 1e-10f);
 
         const float status_bar_h = grid.pair_maps_ready() ? 38.f : 58.f;
 
@@ -849,6 +1101,13 @@ int main(int argc, char** argv) {
             ImGui::Text("t=%.2f | step=%u | E=%.1f | M=%.1f | center=%.2f | edge=%.2f | conf=%.1f",
                         grid.t(), grid.params().step_count,
                         m.total_E, m.total_mass, m.center_E, m.edge_E, m.confinement);
+            if (grid.Nz() > 1) {
+                ImGui::SameLine();
+                ImGui::Text("| Ip≈%.3f | Σ|Δq|_wall=%.3g/step (≈%.3g/s)",
+                            m.Ip_total / fmaxf((float)grid.Nz(), 1.0f),
+                            m.wall_q_sink_step,
+                            m.wall_q_sink_step / fmaxf(grid.params().dt, 1e-12f));
+            }
             ImGui::SameLine(ImGui::GetWindowWidth()-250);
 
             {
@@ -897,11 +1156,20 @@ int main(int argc, char** argv) {
             ImGui::SliderFloat("m0 (accept)", &pp.m0, 0.01f, 5.0f, "%.2f");
             ImGui::SliderFloat("m_ref", &pp.m_ref, 0.01f, 10.0f, "%.2f");
             ImGui::SliderFloat("alpha_m", &pp.alpha_m, 0.0f, 3.0f, "%.2f");
+            {
+                bool mfp = pp.mass_fp_fix != 0;
+                if (ImGui::Checkbox("Mass FP fix (Σm after exchange)", &mfp))
+                    pp.mass_fp_fix = mfp ? 1 : 0;
+                ImGui::TextDisabled(
+                    "Rescale plasma m,q so Σm matches post-prepare; damps float rounding drift.");
+            }
 
             ImGui::Separator(); ImGui::Text("Wall");
             ImGui::SliderFloat("wall_cool", &pp.wall_cooling, 0.1f, 50.0f, "%.1f");
             ImGui::SliderFloat("wall_Emax", &pp.wall_E_max, 1.0f, 500.0f, "%.0f");
             ImGui::SliderFloat("wall sink heat gain", &pp.wall_sink_E_gain, 0.0f, 200.0f, "%.1f");
+            ImGui::SliderFloat("wall edge mass (E exchange)", &pp.wall_edge_mass, 0.5f, 200.0f, "%.1f");
+            ImGui::SliderFloat("rad_alpha (m E^2 loss)", &pp.rad_alpha, 0.0f, 1.0f, "%.5f");
 
             ImGui::Separator(); ImGui::Text("Heater");
             const char* htypes[] = {"constant","pulsed","event_driven","aniso_aware","target","beam_array"};
@@ -941,7 +1209,6 @@ int main(int argc, char** argv) {
 
             ImGui::Separator(); ImGui::Text("Tensor S  (S = E/E_ref + kappa * grad E x grad E / E_ref^2)");
             ImGui::SliderFloat("kappa (aniso)", &pp.grad_kappa, 0.0f, 50.0f);
-            ImGui::SliderFloat("tau (relax)", &pp.grad_tau, 0.01f, 5.0f, "%.3f");
             ImGui::SliderFloat("E_ref", &pp.grad_E_ref, 0.1f, 10.0f);
             ImGui::SliderFloat("eig_lo", &pp.eig_lo, 0.01f, 5.0f, "%.2f");
             ImGui::SliderFloat("eig_hi (cap)", &pp.eig_hi, 100.0f, 1e4f, "%.0f");
@@ -952,17 +1219,19 @@ int main(int argc, char** argv) {
                 ImGui::Separator(); ImGui::Text("Self-consistent B-field");
                 ImGui::SliderInt("field update N", &pp.field_update_every, 0, 100);
                 if (pp.field_update_every > 0) {
-                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, -0.2f, 0.2f, "%.4f");
+                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, 0.0f, 10.0f, "%.3f");
                     ImGui::SliderFloat("Bz_ext", &pp.Bz_ext, 0.0f, 50.0f, "%.2f");
                     ImGui::SliderFloat("charge_mass_scale", &pp.charge_mass_scale, 0.0f, 5.0f, "%.2f");
-                    ImGui::SliderFloat("charge R0", &pp.charge_R0, 1e-8f, 1.0f, "%.6f");
+                    ImGui::SliderFloat("charge R0", &pp.charge_R0, 0.01f, 50.0f, "%.2f");
                     ImGui::SliderFloat("charge_j_scale", &pp.charge_j_scale, 1e-6f, 10.0f, "%.5f");
-                    ImGui::SliderFloat("field_kappa", &pp.field_kappa, 0.0f, 50.0f, "%.1f");
+                    ImGui::TextDisabled("J = j_acc * j_scale / (fe*dt*face); calibrates |B| from MC charge hops");
                     ImGui::SliderFloat("inv_aspect (a/R0)", &pp.inv_aspect_ratio, 0.0f, 10.0f, "%.2f");
+                    ImGui::SliderFloat("C0 (cent, inner x)", &pp.cent_C0, 0.1f, 5.0f, "%.2f");
                     ImGui::SliderInt("SOR iters", &pp.poisson_iters, 5, 2000);
                     ImGui::SliderFloat("SOR omega", &pp.sor_omega, 1.0f, 1.95f, "%.2f");
-                    ImGui::Text("Ip (emergent): %.3f", grid.metrics().Ip_total / fmaxf((float)pp.Nz, 1.0f));
                 }
+                ImGui::Text("Ip (emergent, /Nz): %.4f",
+                            grid.metrics().Ip_total / fmaxf((float)pp.Nz, 1.0f));
             }
 
             ImGui::Separator(); ImGui::Text("Beta / Disruption");
@@ -986,41 +1255,37 @@ int main(int argc, char** argv) {
             if (show_3d) {
                 const char* vol_modes[] = {
                     "Energy", "Mass", "E / m",
-                    "|J|", "|B|",
-                    "J (dir + |J|)"};
+                    "|J|", "Charge q"};
                 ImGui::Combo("Vol data", &vol_data_mode, vol_modes, IM_ARRAYSIZE(vol_modes));
                 if (vol_data_mode == 3) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
                     ImGui::TextWrapped(
-                        "|J| magnitude only. 3D uses dark blue → white (not the yellow hot TF). "
+                        "|J| magnitude only; 3D scalar uses the same transfer function as Energy (hot + alpha). "
+                        "Direction mode: hue encodes J (no blue wedge). "
                         "Same j_acc / Poisson J as below. Between field updates, |J| is frozen.");
                     ImGui::PopStyleColor();
                 }
                 if (vol_data_mode == 4) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
                     ImGui::TextWrapped(
-                        "|B| = √(Bx²+By²+Bz²) from eq_b*: B = ∇×A plus Bz_ext profile. "
-                        "Magnetic induction, not current density.");
+                        "Full scale = peak|q|×sliders below (Controls). "
+                        "Same hot TF as Energy; minus tinted red.");
                     ImGui::PopStyleColor();
                 }
-                if (vol_data_mode == 5) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
-                    ImGui::TextWrapped(
-                        "Hue = (Jx,Jy) direction in xy, brightness ∝ |J|. More transparent than scalar |J|. "
-                        "Wall voxels show neighbor-averaged J (contact). Raise Vol opacity if too faint.");
-                    ImGui::PopStyleColor();
-                }
-                ImGui::SliderFloat("Vol opacity", &vol_opacity, 0.1f, 5.0f, "%.1f");
+                ImGui::SliderFloat("Vol opacity", &vol_opacity, 0.1f, 5.0f, "%.2f");
+                ImGui::TextDisabled("Lower → more transparent volume (ray integral).");
                 ImGui::Checkbox("3D use 2D E_scale", &vol_use_map_E_scale);
                 if (!vol_use_map_E_scale && vol_data_mode == 0)
                     ImGui::SliderFloat("Vol E max", &vol_E_max, 0.5f, 200.0f, "%.1f");
                 if (vol_data_mode == 2)
                     ImGui::SliderFloat("Vol E/m max", &vol_em_max, 0.1f, 500.0f, "%.1f");
-                if (vol_data_mode == 3 || vol_data_mode == 5)
-                    ImGui::SliderFloat("Vol |J| max", &vol_J_max, 0.01f, 500.0f, "%.2f");
-                if (vol_data_mode == 4)
-                    ImGui::SliderFloat("Vol |B| max", &vol_B_max, 0.1f, 200.0f, "%.1f");
+                if (vol_data_mode == 3) {
+                    ImGui::SliderFloat("Vol |J| low cut", &vol_J_low_cut, 0.f, 0.99f, "%.2f");
+                    ImGui::TextDisabled(
+                        "Hide |J| < cut·max(|J|) this frame; top currents keep same color scale.");
+                }
                 ImGui::SliderFloat("Tube wall", &wall_tube_alpha, 0.0f, 1.0f, "%.2f");
+                ImGui::TextDisabled("Rim is thin/light; high values still add haze.");
                 ImGui::SliderInt("Vol depth", &vol_display_nz, 1, 64);
             }
 
@@ -1029,132 +1294,145 @@ int main(int argc, char** argv) {
             if (!auto_scale) ImGui::SliderFloat("E_scale", &E_scale, 0.1f, 20.0f);
             ImGui::SliderFloat("aniso_scale", &aniso_scale, 0.1f, 20.0f);
             ImGui::SliderFloat("gradE_scale", &gradE_scale, 1.0f, 1000.0f);
+            if (Nz > 1) {
+                ImGui::SliderFloat("|J| max (Field map slice + 3D vol)", &vol_J_max, 0.01f, 500.0f, "%.2f");
+                ImGui::TextDisabled("Right tile in Field Maps = |J| at Z slice; same hot scale as 3D |J|.");
+            }
 
             ImGui::Separator();
-            ImGui::Text("Mass display (2D slice + vol)");
+            ImGui::Text("Mass (2D + vol): hot colormap, log vs peak → sparse dark");
             ImGui::Checkbox("Mass autoscale", &mass_viz_autoscale);
             if (!mass_viz_autoscale)
-                ImGui::SliderFloat("Mass color max", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
+                ImGui::SliderFloat("Mass linear peak (m_max)", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
+            ImGui::SliderFloat("Mass log floor (frac of peak)", &g_mass_viz_floor_frac,
+                               1e-8f, 2e-4f, "%.2e", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Mass viz gamma (top soften)", &g_mass_viz_gamma, 1.0f, 2.2f, "%.2f");
+
+            ImGui::Separator();
+            ImGui::Text("Charge (3D volume mode only; same TF as Energy)");
+            ImGui::SliderFloat("Charge full-scale × peak |q|", &g_charge_viz_peak_frac,
+                               0.004f, 0.22f, "%.4f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Charge gamma (<1 lifts faint |q|)", &g_charge_viz_gamma,
+                               0.45f, 1.0f, "%.2f");
+            ImGui::TextDisabled("Smaller first slider → brighter (structure earlier). Defaults ~0.032 / 0.78.");
 
             ImGui::PopItemWidth();
             ImGui::End();
         }
 
-        // ===== Field Maps =====
+        // ===== Field Maps (2D rows + optional 3D below, single column) =====
         {
             float mapx = controls_panel_w + 8.f;
-            // Child widgets are (map_size+20) wide; three in a row need extra slack + spacing
-            const float field_maps_w = 3.f * (map_size + 24.f) + 56.f;
+            const int map_cols = (Nz > 1) ? 4 : 3;
+            const float tile_stride = map_size + 24.f;
+            const float field_maps_w = (float)map_cols * tile_stride + 48.f;
+            const float maps_h = io.DisplaySize.y - status_bar_h;
+
             ImGui::SetNextWindowPos(ImVec2(mapx, status_bar_h));
-            ImGui::SetNextWindowSize(ImVec2(field_maps_w, map_size * 2.f + 100.f));
+            ImGui::SetNextWindowSize(ImVec2(field_maps_w, maps_h));
             ImGui::Begin("Field Maps", nullptr, ImGuiWindowFlags_NoResize);
 
-            if (ImGui::BeginTabBar("FieldTabs")) {
-                if (ImGui::BeginTabItem("2D Maps")) {
-                    if (Nz > 1)
-                        ImGui::SliderInt("Z slice", &z_slice, 0, Nz - 1);
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 10.f));
 
-                    const float* edata = grid.h_E();
-                    const float* adata = grid.h_aniso();
-                    const float* wdata = grid.h_wall_flux();
-                    const float* pdata = grid.h_psi_norm();
-                    const float* gEdata = grid.h_gradE_sq();
-
-                    if (Nz <= 1) {
-                        ImGui::BeginGroup();
-                        if (grid.params().use_equilibrium) {
-                            draw_heatmap("psi_norm", pdata, Nx, Ny, viridis, 0, 1.2f, map_size);
-                            ImGui::SameLine();
-                        }
-                        draw_heatmap("Energy (E)", edata, Nx, Ny, hot, 0, E_scale, map_size);
-                        ImGui::SameLine();
-                        draw_aniso_dir("Anisotropy", adata, grid.h_aniso_angle(), Nx, Ny, aniso_scale, map_size);
-                        ImGui::SameLine();
-                        draw_heatmap("|grad E|^2", gEdata, Nx, Ny, hot, 0, gradE_scale, map_size);
-                        ImGui::EndGroup();
-                    } else {
-                        const float* mdata = grid.h_mass();
-                        ImGui::BeginGroup();
-                        draw_heatmap_slice("Energy (E)", edata, Nx, Ny, Nz, z_slice, hot, 0, E_scale, map_size);
-                        ImGui::SameLine();
-                        draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, viridis, 0.f,
-                                          mass_col_hi, map_size);
-                        ImGui::SameLine();
-                        draw_heatmap_slice("|grad E|^2", gEdata, Nx, Ny, Nz, z_slice, hot, 0, gradE_scale, map_size);
-                        ImGui::EndGroup();
-                    }
-
-                    ImGui::BeginGroup();
-                    const char* map4opts[] = {"Wall flux", "Wall temperature"};
-                    ImGui::PushID("map4sel");
-                    ImGui::Combo("##map4", &active_map, map4opts, 2);
-                    ImGui::PopID();
-                    if (Nz <= 1) {
-                        switch (active_map) {
-                        case 0: draw_heatmap("Wall flux", wdata, Nx, Ny, hot, 0, 0.1f, map_size); break;
-                        case 1: draw_heatmap("Wall temperature", grid.h_wall_E(), Nx, Ny, hot, 0,
-                                              fmaxf(grid.params().wall_E_max, 1.0f), map_size); break;
-                        }
-                    } else {
-                        switch (active_map) {
-                        case 0: draw_heatmap_slice("Wall flux", wdata, Nx, Ny, Nz, z_slice, hot, 0, 0.1f, map_size); break;
-                        case 1: draw_heatmap_slice("Wall temperature", grid.h_wall_E(), Nx, Ny, Nz, z_slice, hot, 0,
-                                              fmaxf(grid.params().wall_E_max, 1.0f), map_size); break;
-                        }
-                    }
-                    ImGui::EndGroup();
-
-                    ImGui::EndTabItem();
-                }
-
-                if (show_3d && ImGui::BeginTabItem("3D Volume")) {
-                    ImVec2 avail = ImGui::GetContentRegionAvail();
-                    int vw = std::max((int)avail.x - 10, 64);
-                    int vh = std::max((int)avail.y - 10, 64);
-
-                    float vol_hi = vol_use_map_E_scale ? E_scale : vol_E_max;
-                    if (vol_data_mode == 1)
-                        vol_hi = mass_col_hi;
-                    else if (vol_data_mode == 2)
-                        vol_hi = fmaxf(vol_em_max, 0.1f);
-                    else if (vol_data_mode == 3 || vol_data_mode == 5)
-                        vol_hi = fmaxf(vol_J_max, 0.01f);
-                    else if (vol_data_mode == 4)
-                        vol_hi = fmaxf(vol_B_max, 0.01f);
-                    int vol_color_mode = (vol_data_mode == 5 && Nz > 1) ? 1 : 0;
-                    int vol_scalar_tf = (vol_data_mode == 3 && Nz > 1) ? 1 : 0;
-                    GLuint vtex = vol_renderer.render(vw, vh, orbit_cam,
-                                                      vol_opacity, 0.0f, vol_hi,
-                                                      grid.params().wall_radius, wall_tube_alpha,
-                                                      vol_color_mode, vol_scalar_tf);
-                    if (vtex) {
-                        ImGui::Image((ImTextureID)(intptr_t)vtex,
-                                     ImVec2((float)vw, (float)vh),
-                                     ImVec2(0,1), ImVec2(1,0));
-                        if (ImGui::IsItemHovered()) {
-                            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                                ImVec2 d = io.MouseDelta;
-                                orbit_cam.theta -= d.x * 0.01f;
-                                orbit_cam.phi   += d.y * 0.01f;
-                                orbit_cam.phi = fmaxf(-1.5f, fminf(1.5f, orbit_cam.phi));
-                            }
-                            if (io.MouseWheel != 0) {
-                                orbit_cam.distance *= (1.0f - io.MouseWheel * 0.1f);
-                                orbit_cam.distance = fmaxf(0.5f, fminf(10.0f, orbit_cam.distance));
-                            }
-                        }
-                    }
-                    ImGui::EndTabItem();
-                }
-                ImGui::EndTabBar();
+            if (Nz > 1) {
+                ImGui::PushItemWidth(field_maps_w - 36.f);
+                ImGui::SliderInt("Z slice", &z_slice, 0, Nz - 1);
+                ImGui::PopItemWidth();
+                ImGui::Separator();
             }
 
+            const float* edata = grid.h_E();
+            const float* adata = grid.h_aniso();
+            const float* pdata = grid.h_psi_norm();
+            const float* gEdata = grid.h_gradE_sq();
+
+            if (Nz <= 1) {
+                ImGui::BeginGroup();
+                if (grid.params().use_equilibrium) {
+                    draw_heatmap("psi_norm", pdata, Nx, Ny, hot, 0, 1.2f, map_size);
+                    ImGui::SameLine(0.f, 8.f);
+                }
+                draw_heatmap("Energy (E)", edata, Nx, Ny, hot, 0, E_scale, map_size);
+                ImGui::SameLine(0.f, 8.f);
+                draw_aniso_dir("Anisotropy", adata, grid.h_aniso_angle(), Nx, Ny, aniso_scale, map_size);
+                ImGui::SameLine(0.f, 8.f);
+                draw_heatmap("|grad E|^2", gEdata, Nx, Ny, hot, 0, gradE_scale, map_size);
+                ImGui::EndGroup();
+                ImGui::Separator();
+                ImGui::BeginGroup();
+                draw_charge_slice("Charge q", grid.h_q(), grid.h_mass(), Nx, Ny, Nz, 0, map_size);
+                ImGui::EndGroup();
+            } else {
+                const float* mdata = grid.h_mass();
+                ImGui::BeginGroup();
+                draw_heatmap_slice("Energy (E)", edata, Nx, Ny, Nz, z_slice, hot, 0, E_scale, map_size);
+                ImGui::SameLine(0.f, 8.f);
+                draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, hot, 0.f,
+                                   mass_col_hi, map_size, true);
+                ImGui::SameLine(0.f, 8.f);
+                draw_heatmap_slice("|grad E|^2", gEdata, Nx, Ny, Nz, z_slice, hot, 0, gradE_scale, map_size);
+                ImGui::SameLine(0.f, 8.f);
+                draw_heatmap_slice("|J|", grid.h_J_mag(), Nx, Ny, Nz, z_slice, hot, 0.f,
+                                   fmaxf(vol_J_max, 1e-8f), map_size);
+                ImGui::EndGroup();
+            }
+
+            if (show_3d && Nz > 1) {
+                ImGui::Separator();
+                ImGui::TextUnformatted("3D volume");
+                ImVec2 cr = ImGui::GetContentRegionAvail();
+                int vw = std::max((int)(cr.x - 8), 180);
+                int vh = std::max((int)((float)vw * 0.52f), 140);
+
+                float vol_hi = vol_use_map_E_scale ? E_scale : vol_E_max;
+                float vol_lo = 0.0f;
+                if (vol_data_mode == 1) {
+                    vol_lo = 0.0f;
+                    vol_hi = 1.0f;
+                } else if (vol_data_mode == 2)
+                    vol_hi = fmaxf(vol_em_max, 0.1f);
+                else if (vol_data_mode == 3)
+                    vol_hi = fmaxf(vol_J_max, 0.01f);
+                else if (vol_data_mode == 4 && Nz > 1) {
+                    vol_lo = 0.0f;
+                    vol_hi = 1.0f;
+                }
+                int vol_color_mode = 0;
+                int vol_scalar_tf = 0;
+                if (vol_data_mode == 4 && Nz > 1)
+                    vol_scalar_tf = 2;
+
+                GLuint vtex = vol_renderer.render(vw, vh, orbit_cam,
+                                                  vol_opacity, vol_lo, vol_hi,
+                                                  grid.params().wall_radius, wall_tube_alpha,
+                                                  vol_color_mode, vol_scalar_tf);
+                if (vtex) {
+                    ImGui::Image((ImTextureID)(intptr_t)vtex,
+                                 ImVec2((float)vw, (float)vh),
+                                 ImVec2(0,1), ImVec2(1,0));
+                    if (ImGui::IsItemHovered()) {
+                        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                            ImVec2 d = io.MouseDelta;
+                            orbit_cam.theta -= d.x * 0.01f;
+                            orbit_cam.phi   += d.y * 0.01f;
+                            orbit_cam.phi = fmaxf(-1.5f, fminf(1.5f, orbit_cam.phi));
+                        }
+                        if (io.MouseWheel != 0) {
+                            orbit_cam.distance *= (1.0f - io.MouseWheel * 0.1f);
+                            orbit_cam.distance = fmaxf(0.5f, fminf(10.0f, orbit_cam.distance));
+                        }
+                    }
+                }
+            }
+
+            ImGui::PopStyleVar();
             ImGui::End();
         }
 
         // ===== Time series plots =====
         {
-            const float field_maps_w_plot = 3.f * (map_size + 24.f) + 56.f;
+            const int plot_map_cols = (Nz > 1) ? 4 : 3;
+            const float field_maps_w_plot = (float)plot_map_cols * (map_size + 24.f) + 56.f;
             float plotx = controls_panel_w + 8.f + field_maps_w_plot + 14.f;
             float plotw = io.DisplaySize.x - plotx - 5;
             if (plotw < 200) plotw = 200;
@@ -1184,6 +1462,26 @@ int main(int argc, char** argv) {
             if (ImGui::CollapsingHeader("Mass", ImGuiTreeNodeFlags_DefaultOpen)) {
                 plot_series("##Mass", ts.t, ts.total_mass, 100);
             }
+            if (ImGui::CollapsingHeader("Wall |I| proxy", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImPlot::BeginPlot("##WallQ", ImVec2(-1, 100))) {
+                    ImPlot::SetupAxes("t","Σ|Δq| / step",ImPlotAxisFlags_AutoFit,ImPlotAxisFlags_AutoFit);
+                    if (!ts.t.empty())
+                        ImPlot::PlotLine("wall", ts.t.data(), ts.wall_q_sink.data(), (int)ts.t.size());
+                    ImPlot::EndPlot();
+                }
+                ImGui::TextDisabled("Charge leaving through wall each step (sum of |Δq| Monte Carlo hits).");
+            }
+            if (ImGui::CollapsingHeader("Ip (volume Jz)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImPlot::BeginPlot("##IpVol", ImVec2(-1, 100))) {
+                    ImPlot::SetupAxes("t","Ip_tot/Nz",ImPlotAxisFlags_AutoFit,ImPlotAxisFlags_AutoFit);
+                    if (!ts.t.empty())
+                        ImPlot::PlotLine("Ip", ts.t.data(), ts.ip_vol.data(), (int)ts.t.size());
+                    ImPlot::EndPlot();
+                }
+            }
+            if (ImGui::CollapsingHeader("Radiation (total_radiation)")) {
+                plot_series("##Rad", ts.t, ts.radiation, 100);
+            }
             if (ImGui::CollapsingHeader("Anisotropy")) {
                 if (ImPlot::BeginPlot("##Aniso", ImVec2(-1,100))) {
                     ImPlot::SetupAxes("t","",ImPlotAxisFlags_AutoFit,ImPlotAxisFlags_AutoFit);
@@ -1207,6 +1505,10 @@ int main(int argc, char** argv) {
             ImGui::BulletText("Wall T peak: %.2f / %.0f", m.max_wall_E, grid.params().wall_E_max);
             ImGui::BulletText("Wall T mean: %.3f", m.mean_wall_E);
             ImGui::BulletText("Total mass: %.1f", m.total_mass);
+            ImGui::BulletText("Wall Σ|Δq| this step: %.4g  (≈%.4g/s)  Ip_z: %.4g",
+                              m.wall_q_sink_step,
+                              m.wall_q_sink_step / fmaxf(grid.params().dt, 1e-12f),
+                              m.Ip_total / fmaxf((float)grid.Nz(), 1.0f));
 
             ImGui::End();
         }
@@ -1216,7 +1518,7 @@ int main(int argc, char** argv) {
         int dw, dh;
         glfwGetFramebufferSize(win, &dw, &dh);
         glViewport(0, 0, dw, dh);
-        glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+        glClearColor(0.f, 0.f, 0.f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);

@@ -48,7 +48,7 @@ struct SimParams {
 
     // --- S dynamics: S_nat = (E/E_ref)·I + κ·(∇E⊗∇E)/E_ref² ---
     float grad_kappa;        // gradient anisotropy coupling strength
-    float grad_tau;          // relaxation time: dS/dt = -(S - S_nat)/tau
+    float grad_tau;          // legacy / unused: S = S_tgt every step (no τ relaxation)
     float grad_E_ref;        // reference energy scale
 
     // --- Wall ---
@@ -73,6 +73,8 @@ struct SimParams {
     float m0;                // half-saturation for acceptance: alpha = m/(m+m0)
     float m_ref;             // reference mass for tensor scaling
     float alpha_m;           // mass power in S_nat: S *= (m/m_ref)^alpha_m
+    // 1: after Kawasaki exchange, rescale plasma m,q so Σm matches post-prepare (float drift).
+    int   mass_fp_fix;
 
     // --- Wall thermal model ---
     float wall_cooling;      // dE_wall/dt -= wall_cooling * E_wall
@@ -80,6 +82,12 @@ struct SimParams {
     // Exchange into wall: transport acceptance = 1 ("zero wall resistance"); energy and
     // resistive charge heating are deposited into wall_E scaled by this (short-circuit / KZ).
     float wall_sink_E_gain;
+    // Effective partner mass on plasma–wall energy edges (Metropolis mass factor vs wma).
+    float wall_edge_mass;
+    // Plasma radiation loss dE/dt = rad_alpha * m * E^2 (E = cell energy); summed energy
+    // deposited uniformly across wall cells (see n_wall_cells). 0 = off.
+    float rad_alpha;
+    int   n_wall_cells;      // set at GpuGrid::init from is_wall count (not loaded from YAML)
 
     // --- Disruption ---
     float beta_limit;        // thermal quench if center_E > beta_limit (0 = off)
@@ -96,12 +104,12 @@ struct SimParams {
     int   poisson_iters;      // SOR iterations per field update
     int   field_update_every; // recompute B from j_acc every N steps (0 = never)
     float sor_omega;          // SOR over-relaxation factor (1.0–1.9)
-    float field_kappa;        // fk in apply_field_congruence: parallel/perp eigenvalue ratio = 1+fk
-    float inv_aspect_ratio;   // ε = a/R₀; centrifugal mass drift ~ ε·m/Bz on +x edges in k_exchange
+    float inv_aspect_ratio;   // ε: C_mid l→r; C_mid=C0(1+t·ε·C0), t=x along +x (inner at i=0)
+    float cent_C0;             // C0: inner C_mid; mass hop P∝p_base(1+Pc), Pc=C_mid·evx
 
     // --- Charge field (3D): q ~ mass scale; MC hop → j_acc → J → ∇²A = -J → B = ∇×A + B_ext ---
     float charge_mass_scale;  // q = scale * m at init
-    float charge_R0;        // R = R0 / Sab (Sab = edge transport scalar); calibrates resistive scale
+    float charge_R0;        // R = R0 / s_scaled; hop P uses s_scaled/R0; kernel floors R0 at 0.01 (no near-zero R)
     // Dimensionless; J from j_acc uses face areas in normalized xy (0..1) and tube_length in z:
     //   Jz  *= scale / (fe*dt*dx^2),   Jx,Jy *= scale / (fe*dt*dx*dz),  dx=1/(max(Nx,Ny)-1), dz=tube_length/Nz
     float charge_j_scale;

@@ -1,10 +1,10 @@
-# 3D tube: same heater / wall / tensor / beta intent as the old 2D file, but all keys
-# match load_sim_params() in gpu_grid.cu (Nz>1, grid.wall_radius, etc.).
+# Mid-res 64^3 tube — demo (coarser than 128^2×32 full run)
+# Derived from tube_3d.yaml
 
 grid:
-  Nx: 128
-  Ny: 128
-  Nz: 32
+  Nx: 64
+  Ny: 64
+  Nz: 64
   wall_radius: 0.45
   tube_length: 1.0
   wall_z_periodic: 1
@@ -14,16 +14,16 @@ grid:
     cx: 0.5
     cy: 0.5
     cz: 0.5
-    rx: 0.06
-    ry: 0.06
-    rz: 0.08
+    rx: 0.1
+    ry: 0.1
+    rz: 0.05
     peak: 1.0
 
 time:
   dt: 0.005
 
 tensor_S:
-  eig_lo: 0.5
+  eig_lo: 0.25
   eig_hi: 1000.0
 
 resolution:
@@ -31,35 +31,27 @@ resolution:
   alpha: 1.0
 
 heater:
-  type: target
-  power: 2.0
-  E_target: 1.5
-  k_heat: 2.0
-  cx: 0.5
-  cy: 0.5
-  rx: 0.06
-  ry: 0.06
-  peak: 1.0
-  response_tau: 0.4
+  type: constant
+  power: 5.0
 
 g_response:
-  grad_kappa: 2.0
+  grad_kappa: 5.0
   grad_tau: 0.3
   grad_E_ref: 1.0
 
 medium:
-  cord_radius: 0.8
+  cord_radius: 0.2
   cord_mass: 1.0
   m0: 0.5
   m_ref: 1.0
   alpha_m: 1.0
 
 wall:
-  cooling: 0.5
-  E_max: 50.0
-
-beta:
-  limit: 150.0
+  cooling: 2.0
+  E_max: 100.0
+  sink_E_gain: 50.0
+  edge_mass: 20.0
+  rad_alpha: 0.0
 
 equilibrium:
   chi_parallel: 1.0
@@ -68,12 +60,17 @@ equilibrium:
 field:
   V_loop: 0.01
   spitzer_exp: 1.5
-  Bz_ext: 5.0
-  poisson_iters: 120
-  update_every: 4
+  Bz_ext: 2.0
+  poisson_iters: 64
+  update_every: 1
   sor_omega: 1.7
   inv_aspect_ratio: 0.1
   cent_C0: 1.0
+
+charge:
+  mass_scale: 1.0
+  R0: 0.01
+  j_scale: 0.001
 
 beams:
   n_beams: 0

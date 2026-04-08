@@ -1,5 +1,5 @@
 // Adaptive 3D field parameter sweep
-// Phase 1: coarse grid over (Ip, Bz, field_kappa, grad_kappa, power)
+// Phase 1: coarse grid over (Ip, Bz, grad_kappa, power)
 // Phase 2: refine around top-scoring points with finer steps
 //
 // Score = barrier_aniso + log(1+confinement) + disruptions
@@ -13,7 +13,7 @@
 #include <numeric>
 
 struct SweepPoint {
-    float Ip, Bz, fkappa, gkappa, power, ohmic;
+    float Ip, Bz, gkappa, power, ohmic;
     float score;
     float center_E, edge_E, confinement, wall_flux;
     float barrier_aniso, mean_aniso, total_E;
@@ -27,7 +27,6 @@ static SweepPoint run_one(aniso::gpu::GpuGrid& grid, SimParams p,
     SweepPoint pt{};
     pt.Ip     = p.V_loop;
     pt.Bz     = p.Bz_ext;
-    pt.fkappa = p.field_kappa;
     pt.gkappa = p.grad_kappa;
     pt.power  = p.heater_power;
     pt.ohmic  = 0.0f;
@@ -88,13 +87,11 @@ static SweepPoint run_one(aniso::gpu::GpuGrid& grid, SimParams p,
     pt.collapsed      = (pt.center_E < 0.01f && pt.edge_E < 0.01f);
     pt.hollow         = (pt.edge_E > pt.center_E * 1.2f) && (pt.center_E > 0.01f);
 
-    // Temporal variance of anisotropy (oscillations = interesting)
     float mean_a = pt.mean_aniso;
     float var = 0;
     for (float a : aniso_samples) var += (a - mean_a) * (a - mean_a);
     pt.aniso_std = sqrtf(var / fmaxf((float)ns, 1.0f));
 
-    // Score: reward instabilities, dynamics, wall_flux spikes
     pt.score = pt.barrier_aniso * 2.0f
              + logf(1.0f + pt.confinement) * 1.0f
              + (float)pt.disruptions * 5.0f
@@ -108,18 +105,18 @@ static SweepPoint run_one(aniso::gpu::GpuGrid& grid, SimParams p,
 }
 
 static void print_header() {
-    printf("phase,Ip,Bz,field_kappa,grad_kappa,power,ohmic,"
+    printf("phase,Ip,Bz,grad_kappa,power,ohmic,"
            "score,center_E,edge_E,confinement,wall_flux,"
            "barrier_aniso,mean_aniso,aniso_std,total_E,"
            "disruptions,collapsed,hollow\n");
 }
 
 static void print_point(int phase, const SweepPoint& pt) {
-    printf("%d,%.3f,%.2f,%.2f,%.1f,%.1f,%.1f,"
+    printf("%d,%.3f,%.2f,%.1f,%.1f,%.1f,"
            "%.3f,%.4f,%.4f,%.4f,%.5f,"
            "%.4f,%.4f,%.4f,%.2f,"
            "%d,%d,%d\n",
-           phase, pt.Ip, pt.Bz, pt.fkappa, pt.gkappa, pt.power, pt.ohmic,
+           phase, pt.Ip, pt.Bz, pt.gkappa, pt.power, pt.ohmic,
            pt.score, pt.center_E, pt.edge_E, pt.confinement, pt.wall_flux,
            pt.barrier_aniso, pt.mean_aniso, pt.aniso_std, pt.total_E,
            pt.disruptions, pt.collapsed?1:0, pt.hollow?1:0);
@@ -157,20 +154,16 @@ int main(int argc, char* argv[]) {
     base.heat_rx = 0.2f; base.heat_ry = 0.2f; base.heat_rz = 0.3f;
     base.heat_peak = 1.0f;
     base.spitzer_exp = 1.5f;
-    base.poisson_iters = 50;
+    base.poisson_iters = 64;
     base.sor_omega = 1.7f;
-    base.field_update_every = 5;
+    base.field_update_every = 1;
 
-    // === Phase 1: coarse grid with ohmic heating ===
     float Ips[]     = {1.0f, 3.0f, 5.0f, 10.0f};
     float Bzs[]     = {1.0f, 2.0f, 5.0f};
-    float fkappas[] = {1.0f, 5.0f, 10.0f};
     float gkappas[] = {3.0f, 8.0f};
     float powers[]  = {2.0f, 5.0f};
-    float ohmics[]  = {0.0f, 5.0f, 15.0f, 30.0f};
-
-    int nI = 4, nB = 3, nF = 3, nG = 2, nP = 2, nO = 4;
-    int total1 = nI * nB * nF * nG * nP * nO;
+    int nI = 4, nB = 3, nG = 2, nP = 2;
+    int total1 = nI * nB * nG * nP;
 
     int warmup1 = 1000, measure1 = 2000, metric_every1 = 100;
 
@@ -186,17 +179,13 @@ int main(int argc, char* argv[]) {
 
     for (int iI = 0; iI < nI; iI++)
     for (int iB = 0; iB < nB; iB++)
-    for (int iF = 0; iF < nF; iF++)
     for (int iG = 0; iG < nG; iG++)
-    for (int iP = 0; iP < nP; iP++)
-    for (int iO = 0; iO < nO; iO++) {
+    for (int iP = 0; iP < nP; iP++) {
         SimParams p = base;
         p.V_loop       = Ips[iI];
         p.Bz_ext       = Bzs[iB];
-        p.field_kappa  = fkappas[iF];
         p.grad_kappa   = gkappas[iG];
         p.heater_power = powers[iP];
-        // ohmic_coeff removed; ohmic heating = Jz * V_loop
 
         SweepPoint pt = run_one(grid, p, warmup1, measure1, metric_every1);
         print_point(1, pt);
@@ -204,16 +193,15 @@ int main(int argc, char* argv[]) {
         idx++;
 
         if (idx % 20 == 0)
-            fprintf(stderr, "[Phase1 %d/%d] Ip=%.1f Bz=%.1f fk=%.1f gk=%.1f pw=%.1f ohm=%.0f "
+            fprintf(stderr, "[Phase1 %d/%d] Ip=%.1f Bz=%.1f gk=%.1f pw=%.1f "
                     "=> score=%.2f conf=%.1f ban=%.2f dis=%d %s\n",
-                    idx, total1, pt.Ip, pt.Bz, pt.fkappa, pt.gkappa, pt.power, pt.ohmic,
+                    idx, total1, pt.Ip, pt.Bz, pt.gkappa, pt.power,
                     pt.score, pt.confinement, pt.barrier_aniso, pt.disruptions,
                     pt.collapsed ? "DEAD" : "");
     }
 
     fprintf(stderr, "Phase 1 done: %d runs\n", idx);
 
-    // === Phase 2: refine top-K points ===
     std::sort(results.begin(), results.end(),
               [](const SweepPoint& a, const SweepPoint& b) {
                   return a.score > b.score;
@@ -234,27 +222,23 @@ int main(int argc, char* argv[]) {
         int nmul = 3;
 
         for (int mI = 0; mI < nmul; mI++)
-        for (int mB = 0; mB < nmul; mB++)
-        for (int mF = 0; mF < nmul; mF++)
-        for (int mO = 0; mO < nmul; mO++) {
-            if (mI == 1 && mB == 1 && mF == 1 && mO == 1) continue;
+        for (int mB = 0; mB < nmul; mB++) {
+            if (mI == 1 && mB == 1) continue;
 
             SimParams p = base;
             p.V_loop       = fmaxf(seed.Ip * muls[mI], 0.01f);
             p.Bz_ext       = fmaxf(seed.Bz * muls[mB], 0.5f);
-            p.field_kappa  = fmaxf(seed.fkappa * muls[mF], 0.1f);
             p.grad_kappa   = seed.gkappa;
             p.heater_power = seed.power;
-            // ohmic_coeff removed
 
             SweepPoint pt = run_one(grid, p, warmup2, measure2, metric_every2);
             print_point(2, pt);
             phase2_count++;
 
             if (phase2_count % 10 == 0)
-                fprintf(stderr, "[Phase2 %d] seed#%d Ip=%.2f Bz=%.1f fk=%.1f ohm=%.1f "
+                fprintf(stderr, "[Phase2 %d] seed#%d Ip=%.2f Bz=%.1f "
                         "=> score=%.2f conf=%.1f ban=%.2f dis=%d\n",
-                        phase2_count, t, pt.Ip, pt.Bz, pt.fkappa, pt.ohmic,
+                        phase2_count, t, pt.Ip, pt.Bz,
                         pt.score, pt.confinement, pt.barrier_aniso, pt.disruptions);
         }
     }

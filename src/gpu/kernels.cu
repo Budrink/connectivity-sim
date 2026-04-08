@@ -11,6 +11,9 @@ static constexpr int BX = 8, BY = 8, BZ = 8;
 static constexpr int BX2 = 16, BY2 = 16;  // kept for Nz==1 fast path
 #define HALO 1
 
+// Plasma–wall edges: fixed Sab = (1+s_avg) so s_scaled = l0*Sab (KZ short-circuit; max coupling vs local S).
+static constexpr float kPlasmaWallSab = 50.0f;
+
 __device__ __forceinline__
 int cidx3(int i, int j, int k, int Ny, int Nz) { return (i*Ny + j)*Nz + k; }
 
@@ -329,6 +332,14 @@ __global__ void k_prepare(GridFieldsPtrs f, SimParams p) {
     float Enew = Ec + Qh * p.dt;
     Enew = fmaxf(Enew, 0.0f);
 
+    // Bremsstrahlung-style loss: dE = rad_alpha * m * E^2 * dt (uses pre-step E); heat → wall uniformly.
+    if (p.rad_alpha > 0.0f && f.rad_step_accum) {
+        float d_rad = p.rad_alpha * mc * Ec * Ec * p.dt;
+        d_rad = fminf(d_rad, Enew);
+        Enew -= d_rad;
+        atomicAdd(f.rad_step_accum, d_rad);
+    }
+
     // Wall loss: interior cells adjacent to walls lose energy/mass
     float wf = 0;
     {
@@ -374,9 +385,13 @@ __global__ void k_prepare(GridFieldsPtrs f, SimParams p) {
 //  Pre-computed pair map: each cell has a direction code (0-26).
 //  Code 13 = no pair / partner. Only "owners" have code != 13.
 //  Each owner thread handles exchange for its pair exclusively.
-//  Energy: no flow into m ~ 0; accepted fraction alpha_t = m_recv/(m_recv+m0).
-//  Wall pairs: no mass transfer; Step 3 uses same p_event; wall acts as ideal-mass end (alpha_t=1);
-//  bias uses wall_E like wEb; wall→plasma uses atomicAdd(wall_E, -dE).
+//  Edge s_avg = mean directed transport (≥0); s_scaled = l0*(1+s_avg). Plasma–wall: Sab=kPlasmaWallSab (fixed).
+//  dist_fac = 1/√(di²+dj²+dk²). p_event = (s_scaled/m0)*dt*dist_fac (no ×2).
+//  Step1 mass: propose δM (U fractions of neutral/charged slabs); Π_B = δM/(|B×ê|mq+δM+ε);
+//  p_try = p_event·Π_B·(1+Pc)·exp(Ma−δM−Mb+ε), clamp01; wall Π_B uses Ma in denom. Owner→partner only.
+//  Step3 energy A→B only: δE = U·wEa; if wma>wmb (plasma) P *= wmb/wma; wall: no mass factor on P.
+//  P = clamp(exp(wEa−δE−Eb_side+ε)·Ps,0,1); Ps = dist_fac·s_scaled/grad_E_ref.
+//  Step4 charge: P includes ×dist_fac (B as above).
 //  Shift + XY rotation applied to map lookup each step.
 // ============================================================
 
@@ -405,16 +420,7 @@ __device__ inline void compute_transport_tensor(
         resolution_eigs3(e3, p.l0, p.res_alpha, rl1, rl2, rl3);
         e3.l1 = rl1; e3.l2 = rl2; e3.l3 = rl3;
         reconstruct3x3(e3, T00, T01, T02, T11, T12, T22);
-        float Bz_loc = local_Bz(p.Bz_ext, p.inv_aspect_ratio, gi, p.Nx);
-        float Bx = f.eq_bR[gk];
-        float By = f.eq_bZ[gk];
-        float Bmag2 = Bx*Bx + By*By + Bz_loc*Bz_loc;
-        if (Bmag2 > 1e-12f) {
-            float iBmag = rsqrtf(Bmag2);
-            float fk = p.field_kappa;
-            apply_field_congruence(T00, T01, T02, T11, T12, T22,
-                                   Bx*iBmag, By*iBmag, Bz_loc*iBmag, fk);
-        }
+        // B does not reshape T; field biases mass/charge hop probabilities (Π_B) in k_exchange.
         float T_max = 0.4f / p.dt;
         T00 = fminf(T00, T_max); T11 = fminf(T11, T_max); T22 = fminf(T22, T_max);
     } else {
@@ -476,6 +482,8 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
     float Ea = f.E_buf[gk];
     float ma = f.m_buf[gk];
     float qa = f.q_buf[gk];
+    const float qa_snap = qa;
+    const float qb_snap = qb;
 
     float Ta00, Ta01, Ta02, Ta11, Ta12, Ta22;
     compute_transport_tensor(f, p, gi, gj, gk_z, gk,
@@ -490,12 +498,15 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
 
     float sp_a = dir_transport(Ta00, Ta01, Ta02, Ta11, Ta12, Ta22, di, dj, dk);
     float s_avg = partner_wall
-        ? fmaxf(sp_a, 0.0f)
+        ? (kPlasmaWallSab - 1.0f)
         : 0.5f * (fmaxf(sp_a, 0.0f) + fmaxf(sp_b, 0.0f));
+    float l0 = fmaxf(p.l0, 1e-8f);
+    float s_scaled = l0 * (1.0f + s_avg);
 
-    int asum = abs(di) + abs(dj) + abs(dk);
-    float dist_fac = (asum == 1) ? 1.0f : (asum == 2) ? 0.5f : 0.333f;
-    float p_event = 2.0f * s_avg * p.dt * dist_fac;
+    float hlen = sqrtf(fmaxf((float)(di * di + dj * dj + dk * dk), 1e-12f));
+    float dist_fac = 1.0f / hlen;
+    float m0d = fmaxf(p.m0, 1e-8f);
+    float p_event = (s_scaled / m0d) * p.dt * dist_fac;
 
     unsigned int step = p.step_count;
     unsigned int edge_key = (unsigned)ms * 1048583u
@@ -505,201 +516,261 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
     float wall_sink_heat = 0.0f;
     const float wgain = fmaxf(p.wall_sink_E_gain, 0.0f);
 
-    // --- Step 1: Mass exchange (then carried energy); wall partner: no mass crosses boundary ---
+    // Unit edge direction ê (same geometry as charge/j_acc step).
+    float dx_xy_e = 1.0f / (float)(max(p.Nx, p.Ny) - 1);
+    float dz_z_e = p.tube_length / (float)max(p.Nz, 1);
+    float evx = (float)di * dx_xy_e;
+    float evy = (float)dj * dx_xy_e;
+    float evz = (float)dk * dz_z_e;
+    float evlen = sqrtf(evx * evx + evy * evy + evz * evz);
+    if (evlen > 1e-12f) {
+        evx /= evlen;
+        evy /= evlen;
+        evz /= evlen;
+    } else {
+        evx = evy = 0.0f;
+        evz = 1.0f;
+    }
+
+    float Pi_B_mass = 1.0f;
+    float Pi_B_charge = 1.0f;
+    const float eps_bb = 1e-8f;
+    float Bcross = 0.0f;
+    float mq_e_e = 1e-20f;
+    if (p.Nz > 1) {
+        float Bx = f.eq_bR[gk], By = f.eq_bZ[gk], Bz = f.eq_bPhi[gk];
+        float cx = By * evz - Bz * evy;
+        float cy = Bz * evx - Bx * evz;
+        float cz = Bx * evy - By * evx;
+        Bcross = sqrtf(fmaxf(cx * cx + cy * cy + cz * cz, 0.f));
+        mq_e_e = 0.5f * (fabsf(qa) + fabsf(qb))
+            / fmaxf(p.charge_mass_scale, 1e-8f);
+        mq_e_e = fmaxf(mq_e_e, 1e-20f);
+    }
+
+    float C0s = fmaxf(p.cent_C0, 1e-6f);
+    float x_mid = 0.5f;
+    if (p.Nx > 1) {
+        if (di != 0) {
+            float xa = (float)gi / (float)(p.Nx - 1);
+            float xb = (float)(gi + di) / (float)(p.Nx - 1);
+            x_mid = 0.5f * (xa + xb);
+        } else {
+            x_mid = (float)gi / (float)(p.Nx - 1);
+        }
+    }
+    // Monotonic "radius" in +x: left wall = inner (small C), right = outer (large C).
+    float tx_edge = x_mid;
+    float C_mid = fmaxf(C0s * (1.0f + tx_edge * (p.inv_aspect_ratio * C0s)), 1e-8f);
+    float Pc_unc = C_mid * evx;
+    float Pc = fminf(fmaxf(Pc_unc, -0.95f), 10.0f);
+
+    if (p.Nz > 1 && partner_wall) {
+        float den_w = Bcross * mq_e_e + ma + eps_bb;
+        Pi_B_charge = ma / fmaxf(den_w, 1e-30f);
+        Pi_B_mass = Pi_B_charge;
+    }
+
+    // --- Step 1: Mass owner→partner (δM proposal first, then Metropolis weight).
     if (!partner_wall && ma + mb > 1e-10f) {
+        float m_don = ma + dMa;
+        float q_here = qa + dqa;
+        float scale_q = fmaxf(p.charge_mass_scale, 1e-20f);
+        float mq_raw = fabsf(q_here) / scale_q;
+        float mq_don = fminf(mq_raw, m_don);
+        float mn_don = fmaxf(m_don - mq_don, 0.f);
+
+        float u_amt_n = gpu_rand_uniform(p.seed, edge_key, step, 92u);
+        float u_amt_c = gpu_rand_uniform(p.seed, edge_key, step, 93u);
+        float dm_n = u_amt_n * mn_don;
+        float dm_q = u_amt_c * mq_don;
+        float deltaM = dm_n + dm_q;
+
+        if (p.Nz > 1) {
+            float den = Bcross * mq_e_e + deltaM + eps_bb;
+            Pi_B_mass = deltaM / fmaxf(den, 1e-30f);
+        } else {
+            Pi_B_mass = 1.0f;
+        }
+        Pi_B_charge = Pi_B_mass;
+
+        float p_base = p_event * Pi_B_mass;
+        float p_mass_line = fmaxf(p_base * (1.0f + Pc), 0.0f);
+        const float mass_met_eps = 1e-8f;
+        float ex_m = ma - deltaM - mb + mass_met_eps;
+        ex_m = fminf(fmaxf(ex_m, -60.0f), 60.0f);
+        p_mass_line *= expf(ex_m);
+        float p_eff_mass = fminf(p_mass_line, 1.0f);
+
         float u_gate_m = gpu_rand_uniform(p.seed, edge_key, step, 90u);
-        if (p_event >= 1.0f || u_gate_m <= p_event) {
+        bool mass_gate = (p_mass_line >= 1.0f) || (u_gate_m <= p_eff_mass);
+        if (mass_gate) {
             float Ea_mid = Ea;
-            float Eb_mid = Eb;
-            float bias_m = ma / (ma + mb + 1e-8f);
-            float u_dir_m = gpu_rand_uniform(p.seed, edge_key, step, 91u);
-            float u_amt_m = gpu_rand_uniform(p.seed, edge_key, step, 92u);
-
-            if (u_dir_m < bias_m) {
-                float dm = u_amt_m * ma;
-                float de = (ma > 1e-8f) ? dm * Ea_mid / ma : 0.0f;
-                dMa -= dm;
-                dEa -= de;
-                dMb += dm;
-                dEb += de;
-            } else {
-                float dm = u_amt_m * mb;
-                float de = (mb > 1e-8f) ? dm * Eb_mid / mb : 0.0f;
-                dMb -= dm;
-                dMa += dm;
-                dEb -= de;
-                dEa += de;
+            float dm = deltaM;
+            float de = (m_don > 1e-8f) ? dm * Ea_mid / m_don : 0.0f;
+            if (dm_q > 0.f && fabsf(q_here) > 1e-20f && mq_don > 1e-20f) {
+                float dq_m = q_here * (dm_q / mq_don);
+                dqa -= dq_m;
+                dqb += dq_m;
             }
+            dMa -= dm;
+            dEa -= de;
+            dMb += dm;
+            dEb += de;
         }
     }
 
-    // --- Step 2: Centrifugal mass drift (+x) ---
-    if (!partner_wall && p.inv_aspect_ratio > 0.0f && dk == 0 && di != 0 && ma + mb > 1e-10f) {
-        float Bz_loc = local_Bz(p.Bz_ext, p.inv_aspect_ratio, gi, p.Nx);
-        float m_avg = 0.5f * (ma + mb);
-        float v_cent = p.inv_aspect_ratio * m_avg / fmaxf(Bz_loc, 0.01f);
-        float p_cent = fminf(v_cent * p.dt * dist_fac, 1.0f);
-        float m_up = (di > 0) ? ma : mb;
-        float c1 = gpu_rand_uniform(p.seed, edge_key, step, 93u);
-        float c2 = gpu_rand_uniform(p.seed, edge_key, step, 94u);
-        if (c2 <= p_cent && m_up > 1e-10f) {
-            float dm = c1 * m_up;
-            float ma_aft = ma + dMa;
-            float mb_aft = mb + dMb;
-            float Ea_mid = Ea + dEa;
-            float Eb_mid = Eb + dEb;
-            if (di > 0) {
-                dm = fminf(dm, fmaxf(ma_aft, 0.0f) * 0.99f);
-                if (dm > 0.0f) {
-                    dMa -= dm;
-                    dMb += dm;
-                    if (ma_aft > 1e-8f) {
-                        float de = dm * Ea_mid / ma_aft;
-                        dEa -= de;
-                        dEb += de;
-                    }
-                }
-            } else {
-                dm = fminf(dm, fmaxf(mb_aft, 0.0f) * 0.99f);
-                if (dm > 0.0f) {
-                    dMa += dm;
-                    dMb -= dm;
-                    if (mb_aft > 1e-8f) {
-                        float de = dm * Eb_mid / mb_aft;
-                        dEb -= de;
-                        dEa += de;
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Step 3: Energy exchange (same p_event as mass; wall = ideal-mass reservoir, wall_E as wEb) ---
+    // --- Step 3: Energy exchange. Plasma–plasma: δE = U·wEa; P = exp(ex)·Ps_en; heavy→light P *= wmb/wma.
+    // Plasma–wall: same P-shape (Ps_en + mass ratio); partner mass = wall_edge_mass. 50/50 direction.
     {
-        float wma = ma + dMa, wmb = mb + dMb;
+        float wma = ma + dMa;
+        float wmb = mb + dMb;
         float wEa = Ea + dEa, wEb = Eb + dEb;
-        const float m_empty = 1e-8f;
-        float u_gate = gpu_rand_uniform(p.seed, edge_key, step, 70u);
-        if (p_event >= 1.0f || u_gate <= p_event) {
-            float bias;
-            if (partner_wall && f.wall_E) {
-                float wEw = f.wall_E[pk_idx];
-                bias = wEa / (wEa + wEw + 1e-8f);
-            } else {
-                bias = wEa / (wEa + wEb + 1e-8f);
-            }
+        const float en_met_eps = 1e-8f;
+        float Eref = fmaxf(p.grad_E_ref, 1e-20f);
+        float Ps_en = dist_fac * s_scaled / Eref;
+        float m_w = fmaxf(p.wall_edge_mass, 1e-20f);
+
+        if (partner_wall && f.wall_E) {
+            float eb_side = f.wall_E[pk_idx];
             float u_dir = gpu_rand_uniform(p.seed, edge_key, step, 71u);
-            float u_amt = gpu_rand_uniform(p.seed, edge_key, step, 72u);
-
-            if (u_dir < bias) {
-                if (partner_wall && f.wall_E) {
-                    if (wEa > 1e-8f) {
-                        float amount = u_amt * wEa;
-                        float dE = amount * 1.0f;
-                        dEa -= dE;
-                        wall_sink_heat += wgain * dE;
-                    }
-                } else if (wmb >= m_empty) {
-                    float amount = u_amt * wEa;
-                    float alpha_t = wmb / (wmb + p.m0);
-                    float dE = amount * alpha_t;
-                    dEa -= dE;
-                    dEb += dE;
-                }
-            } else {
-                if (partner_wall && f.wall_E) {
-                    float wEw = f.wall_E[pk_idx];
-                    if (wEw > 1e-8f && wma >= m_empty) {
-                        float amount = u_amt * wEw;
-                        float dE = amount * 1.0f;
-                        dEa += dE;
-                        atomicAdd(&f.wall_E[pk_idx], -dE);
-                    }
-                } else if (wma >= m_empty) {
-                    float amount = u_amt * wEb;
-                    float alpha_t = wma / (wma + p.m0);
-                    float dE = amount * alpha_t;
-                    dEb -= dE;
-                    dEa += dE;
-                }
-            }
-        }
-    }
-
-    // --- Step 4: Charge MC + j_acc (3D only) ---
-    // R = R0/Sab; P = (1+Pv)*Pdelta*Pq*Sab; Pdelta = (1-delta+0.05)/1.05 (delta = U(0,1) share moved);
-    // dq = delta*q_donor; dE = Pv*dq^2*R0/Sab, split ½ per plasma cell.
-    if (p.Nz > 1 && f.j_acc_x && f.j_acc_y && f.j_acc_z) {
-        float wqa = qa + dqa, wqb = qb + dqb;
-        if (wqa + wqb > 1e-20f) {
-            float Sab = fmaxf(s_avg, 1e-12f);
-            float dx_xy = 1.0f / (float)(max(p.Nx, p.Ny) - 1);
-            float dz_z = p.tube_length / (float)p.Nz;
-            float vx = (float)di * dx_xy;
-            float vy = (float)dj * dx_xy;
-            float vz = (float)dk * dz_z;
-            float vlen = sqrtf(vx * vx + vy * vy + vz * vz);
-            if (vlen > 1e-12f) {
-                vx /= vlen;
-                vy /= vlen;
-                vz /= vlen;
-            } else {
-                vx = vy = vz = 0.0f;
-            }
-            float Pv = p.V_loop * vz;
-
-            float bias_q = wqa / (wqa + wqb + 1e-8f);
-            float udir = gpu_rand_uniform(p.seed, edge_key, step, 111u);
-            float delta = gpu_rand_uniform(p.seed, edge_key, step, 112u);
-            const float pd_floor = 0.05f;
-            float Pdelta = (1.0f - delta + pd_floor) / (1.0f + pd_floor);
-            float qeps = 1e-8f;
-            float Pq = (wqb - wqa) / (wqa + wqb + qeps);
-            float P = (1.0f + Pv) * Pdelta * Pq * Sab;
-            P = fminf(fmaxf(P, 0.0f), 1.0f);
-
-            float uq = gpu_rand_uniform(p.seed, edge_key, step, 110u);
-            if (uq <= P) {
-                if (udir < bias_q) {
-                    if (wqa > 1e-20f) {
-                        float dq = delta * wqa;
-                        dqa -= dq;
-                        float dE = Pv * dq * dq * p.charge_R0 / Sab;
-                        float half = 0.5f * dE;
-                        if (!partner_wall) {
-                            dqb += dq;
-                            dEa += half;
-                            dEb += half;
-                            f.j_acc_x[gk]     += -0.5f * dq * vx;
-                            f.j_acc_y[gk]     += -0.5f * dq * vy;
-                            f.j_acc_z[gk]     += -0.5f * dq * vz;
-                            f.j_acc_x[pk_idx] += 0.5f * dq * vx;
-                            f.j_acc_y[pk_idx] += 0.5f * dq * vy;
-                            f.j_acc_z[pk_idx] += 0.5f * dq * vz;
-                        } else {
-                            dEa += half;
-                            wall_sink_heat += wgain * half;
-                            f.j_acc_x[gk] += -0.5f * dq * vx;
-                            f.j_acc_y[gk] += -0.5f * dq * vy;
-                            f.j_acc_z[gk] += -0.5f * dq * vz;
+            bool forward = (u_dir < 0.5f);
+            if (forward) {
+                if (wEa > 1e-20f) {
+                    float u_amt_e = gpu_rand_uniform(p.seed, edge_key, step, 72u);
+                    float deltaE = u_amt_e * wEa;
+                    if (deltaE > 1e-30f) {
+                        float ex_e = wEa - deltaE - eb_side + en_met_eps;
+                        ex_e = fminf(fmaxf(ex_e, -60.0f), 60.0f);
+                        float Pbase_e = expf(ex_e);
+                        float P_en = Pbase_e * Ps_en;
+                        if (wma > m_w)
+                            P_en *= m_w / fmaxf(wma, 1e-30f);
+                        P_en = fminf(fmaxf(P_en, 0.0f), 1.0f);
+                        float u_gate_e = gpu_rand_uniform(p.seed, edge_key, step, 70u);
+                        if (u_gate_e <= P_en) {
+                            dEa -= deltaE;
+                            wall_sink_heat += wgain * deltaE;
                         }
                     }
-                } else {
-                    if (wqb > 1e-20f && !partner_wall) {
-                        float dq = delta * wqb;
-                        dqa += dq;
-                        dqb -= dq;
-                        float dE = Pv * dq * dq * p.charge_R0 / Sab;
-                        float half = 0.5f * dE;
-                        dEa += half;
-                        dEb += half;
-                        f.j_acc_x[gk]      += 0.5f * dq * vx;
-                        f.j_acc_y[gk]      += 0.5f * dq * vy;
-                        f.j_acc_z[gk]      += 0.5f * dq * vz;
-                        f.j_acc_x[pk_idx] += -0.5f * dq * vx;
-                        f.j_acc_y[pk_idx] += -0.5f * dq * vy;
-                        f.j_acc_z[pk_idx] += -0.5f * dq * vz;
+                }
+            } else {
+                if (eb_side > 1e-20f) {
+                    float u_amt_e = gpu_rand_uniform(p.seed, edge_key, step, 72u);
+                    float deltaE = u_amt_e * eb_side;
+                    if (deltaE > 1e-30f) {
+                        float ex_m = eb_side - deltaE - wEa + en_met_eps;
+                        ex_m = fminf(fmaxf(ex_m, -60.0f), 60.0f);
+                        float Pbase_m = expf(ex_m);
+                        float P_en = Pbase_m * Ps_en;
+                        if (m_w > wma)
+                            P_en *= wma / fmaxf(m_w, 1e-30f);
+                        P_en = fminf(fmaxf(P_en, 0.0f), 1.0f);
+                        float u_gate_e = gpu_rand_uniform(p.seed, edge_key, step, 70u);
+                        if (u_gate_e <= P_en) {
+                            dEa += deltaE;
+                            atomicAdd(&f.wall_E[pk_idx], -deltaE);
+                        }
                     }
+                }
+            }
+        } else if (wEa > 1e-20f) {
+            float u_amt_e = gpu_rand_uniform(p.seed, edge_key, step, 72u);
+            float deltaE = u_amt_e * wEa;
+            if (deltaE > 1e-30f) {
+                float eb_side = wEb;
+                float ex_e = wEa - deltaE - eb_side + en_met_eps;
+                ex_e = fminf(fmaxf(ex_e, -60.0f), 60.0f);
+                float Pbase_e = expf(ex_e);
+                float P_en = Pbase_e * Ps_en;
+                if (wma > wmb)
+                    P_en *= wmb / fmaxf(wma, 1e-30f);
+                P_en = fminf(fmaxf(P_en, 0.0f), 1.0f);
+                float u_gate_e = gpu_rand_uniform(p.seed, edge_key, step, 70u);
+                if (u_gate_e <= P_en) {
+                    dEa -= deltaE;
+                    dEb += deltaE;
+                }
+            }
+        }
+    }
+
+    // --- Step 4: Charge MC + j_acc (3D only); always owner A → partner B ---
+    // δ~U(0,1), dq = δ·q_a. Pdelta = exp(q_a − dq − q_b + ε) — not clamped; small when post-hop gap ≪ 0.
+    // P = clamp₀¹[(1+Pv)·Pdelta·Pq·(s_scaled/R0)·Π_B·dist_fac]; Pq = 1 at wall, else (q_b−q_a)/(q_a+q_b+eps).
+    // partner_wall: P=1 (ideal sink, q_wall≈0). Joule: ½ to plasma + ½ to wall (same as plasma–plasma);
+    // dE_coul only (no B work term — B affects Π_B / transport, not energy sink here). j_acc along ê.
+    if (p.Nz > 1 && f.j_acc_x && f.j_acc_y && f.j_acc_z) {
+        float wqa = qa + dqa, wqb = qb + dqb;
+        if (wqa > 1e-20f) {
+            float R0q = fmaxf(p.charge_R0, 0.01f);
+            float vx = evx, vy = evy, vz = evz;
+            float Pv = p.V_loop * vz;
+
+            float delta = gpu_rand_uniform(p.seed, edge_key, step, 112u);
+            float dq = delta * wqa;
+            const float pd_exp_eps = 1e-8f;
+            float Pdelta = expf(wqa - dq - wqb + pd_exp_eps);
+            float qeps = 1e-8f;
+            float Pq = partner_wall
+                ? 1.0f
+                : (wqb - wqa) / (wqa + wqb + qeps);
+            float P = (1.0f + Pv) * Pdelta * Pq * (s_scaled / R0q);
+            P *= Pi_B_charge * dist_fac;
+            P = fminf(fmaxf(P, 0.0f), 1.0f);
+            if (partner_wall)
+                P = 1.0f;
+
+            float uq = gpu_rand_uniform(p.seed, edge_key, step, 110u);
+            float R_edge = R0q / s_scaled;
+            if (uq <= P) {
+                if (partner_wall) {
+                    float f_q = fminf(
+                        fabsf(dq) / fmaxf(fabsf(wqa), 1e-20f), 1.f);
+                    float dE_joul = Pv * dq * dq * R0q / s_scaled;
+                    float half_j = 0.5f * dE_joul;
+                    float dE_coul = f_q * (wqa * wqa)
+                        / fmaxf(R_edge, 1e-20f);
+                    float dE_cl = dE_coul;
+                    float E_pre = Ea + dEa;
+                    if (E_pre + half_j - dE_cl >= 0.f) {
+                        dqa -= dq;
+                        dEa += half_j;
+                        dEa -= dE_cl;
+                        wall_sink_heat += wgain * (half_j + dE_cl);
+                        f.j_acc_x[gk] += -dq * vx;
+                        f.j_acc_y[gk] += -dq * vy;
+                        f.j_acc_z[gk] += -dq * vz;
+                        if (f.wall_q_sink_accum)
+                            atomicAdd(f.wall_q_sink_accum, fabsf(dq));
+                    }
+                } else {
+                    float qc_as = 0.5f * (qa_snap + wqa);
+                    float qc_bs = 0.5f * (qb_snap + wqb);
+                    float q_pair_s =
+                        (qc_as - qc_bs)
+                        / (fabsf(qc_as) + fabsf(qc_bs) + 1e-20f);
+                    float f_q = fminf(
+                        fabsf(dq) / fmaxf(fabsf(wqa), 1e-20f), 1.f);
+                    float dEc_raw = q_pair_s * (wqa * wqa)
+                        / fmaxf(R_edge, 1e-20f) * f_q;
+                    float dEc_mag = fabsf(dEc_raw);
+                    float Ea_c = fmaxf(Ea + dEa, 0.f);
+                    float dEc_apply = fminf(dEc_mag, Ea_c);
+                    dEa -= dEc_apply;
+                    dEb += dEc_apply;
+                    dqa -= dq;
+                    dqb += dq;
+                    float dE_joul = Pv * dq * dq * R0q / s_scaled;
+                    float half_j = 0.5f * dE_joul;
+                    dEa += half_j;
+                    dEb += half_j;
+                    f.j_acc_x[gk]     += -0.5f * dq * vx;
+                    f.j_acc_y[gk]     += -0.5f * dq * vy;
+                    f.j_acc_z[gk]     += -0.5f * dq * vz;
+                    f.j_acc_x[pk_idx] += 0.5f * dq * vx;
+                    f.j_acc_y[pk_idx] += 0.5f * dq * vy;
+                    f.j_acc_z[pk_idx] += 0.5f * dq * vz;
                 }
             }
         }
@@ -707,6 +778,26 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
 
     if (partner_wall && f.wall_E && wall_sink_heat > 0.0f)
         atomicAdd(&f.wall_E[pk_idx], wall_sink_heat);
+
+    // Mass: avoid fmaxf destroying mass when ma+dMa<0 (float edge). Redistribute with partner.
+    if (!partner_wall) {
+        float sa = ma + dMa;
+        if (sa < 0.f) {
+            float fix = -sa;
+            dMa += fix;
+            dMb -= fix;
+        }
+        float sb = mb + dMb;
+        if (sb < 0.f) {
+            float fix = -sb;
+            dMb += fix;
+            dMa -= fix;
+        }
+    } else {
+        float sa = ma + dMa;
+        if (sa < 0.f)
+            dMa = -ma;
+    }
 
     // --- Write both cells ---
     float Ea_new = fmaxf(Ea + dEa, 0.0f);
@@ -742,12 +833,8 @@ __global__ void k_tensor(GridFieldsPtrs f, SimParams p) {
         return;
     }
 
-    float dt = p.dt;
     float Ek = fmaxf(f.E_buf[gk], 0.0f);
     float dx = grid_dx(p.Nx, p.Ny);
-
-    float ss00=f.s00[gk], ss01=f.s01[gk], ss02=f.s02[gk];
-    float ss11=f.s11[gk], ss12=f.s12[gk], ss22=f.s22[gk];
 
     float mk = fmaxf(f.m_buf[gk], 0.0f);
     float E_ref = fmaxf(p.grad_E_ref, 1e-6f);
@@ -779,14 +866,13 @@ __global__ void k_tensor(GridFieldsPtrs f, SimParams p) {
     tgt12 += kap * dEdy * dEdz;
     tgt22 += kap * dEdz * dEdz;
 
-    float inv_tau = 1.0f / fmaxf(p.grad_tau, 0.01f);
-
-    float ns00 = ss00 + (-inv_tau * (ss00 - tgt00)) * dt;
-    float ns01 = ss01 + (-inv_tau * (ss01 - tgt01)) * dt;
-    float ns02 = ss02 + (-inv_tau * (ss02 - tgt02)) * dt;
-    float ns11 = ss11 + (-inv_tau * (ss11 - tgt11)) * dt;
-    float ns12 = ss12 + (-inv_tau * (ss12 - tgt12)) * dt;
-    float ns22 = ss22 + (-inv_tau * (ss22 - tgt22)) * dt;
+    // No relaxation: S matches the instantaneous target (tgt); only eig clamp below.
+    float ns00 = tgt00;
+    float ns01 = tgt01;
+    float ns02 = tgt02;
+    float ns11 = tgt11;
+    float ns12 = tgt12;
+    float ns22 = tgt22;
 
     if (p.Nz > 1) {
         clamp_eig3x3(ns00, ns01, ns02, ns11, ns12, ns22, p.eig_lo, p.eig_hi);
@@ -842,6 +928,9 @@ __global__ void k_readback(GridFieldsPtrs f, SimParams p) {
         } else
             f.rb_B_mag[gk] = 0.0f;
     }
+    if (f.rb_charge)
+        f.rb_charge[gk] = f.q[gk];
+
     if (f.rb_J_vis && p.Nz > 1 && f.Jx && f.Jy && f.Jz) {
         float jx, jy, jz;
         if (f.is_wall[gk]) {
@@ -1060,6 +1149,44 @@ __global__ void k_update_bfield(GridFieldsPtrs f, SimParams p) {
 }
 
 // ============================================================
+//  Mass FP drift fix: Σm (double) after prepare vs after exchange (exchange should conserve)
+// ============================================================
+__global__ void k_sum_mass_plasma_mbuf(GridFieldsPtrs f, SimParams p, double* out) {
+    __shared__ double blk[256];
+    int N = p.Nx * p.Ny * p.Nz;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    double my = 0.0;
+    if (idx < N && !f.is_wall[idx])
+        my = (double)f.m_buf[idx];
+    blk[tid] = my;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s)
+            blk[tid] += blk[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0)
+        atomicAdd(out, blk[0]);
+}
+
+__global__ void k_apply_mass_fp_fix(GridFieldsPtrs f, SimParams p,
+                                    const double* sum_ref, const double* sum_cur) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = p.Nx * p.Ny * p.Nz;
+    if (idx >= N) return;
+    if (f.is_wall[idx]) return;
+    double ref = *sum_ref;
+    double cur = *sum_cur;
+    if (cur < 1e-300 || ref < 0.0) return;
+    double rat = ref / cur;
+    if (fabs(rat - 1.0) < 1e-15) return;
+    float s = (float)rat;
+    f.m_buf[idx] *= s;
+    f.q_buf[idx] *= s;
+}
+
+// ============================================================
 //  Launch wrappers (3D grid)
 // ============================================================
 static dim3 gd3(int Nx, int Ny, int Nz) {
@@ -1073,8 +1200,26 @@ void launch_init_fields(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s) {
 void launch_update_delayed_S(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s) {
     k_update_delayed_S<<<gd3(p.Nx,p.Ny,p.Nz), bd3(), 0, s>>>(f, p);
 }
+__global__ void k_wall_rad_deposit(GridFieldsPtrs f, SimParams p) {
+    if (p.rad_alpha <= 0.0f || p.n_wall_cells <= 0) return;
+    if (!f.wall_E || !f.rad_step_accum) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+    if (i >= p.Nx || j >= p.Ny || k >= p.Nz) return;
+    int gk = cidx3(i, j, k, p.Ny, p.Nz);
+    if (!f.is_wall[gk]) return;
+    float tot = *f.rad_step_accum;
+    if (tot <= 0.0f) return;
+    float per = tot / (float)p.n_wall_cells;
+    f.wall_E[gk] += per;
+}
+
 void launch_prepare_step(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s) {
+    if (f.rad_step_accum)
+        cudaMemsetAsync(f.rad_step_accum, 0, sizeof(float), s);
     k_prepare<<<gd3(p.Nx,p.Ny,p.Nz), bd3(), 0, s>>>(f, p);
+    k_wall_rad_deposit<<<gd3(p.Nx,p.Ny,p.Nz), bd3(), 0, s>>>(f, p);
 }
 void launch_exchange(GridFieldsPtrs& f, const SimParams& p,
                      int shift_z, int map_slot, int num_maps,
@@ -1082,6 +1227,24 @@ void launch_exchange(GridFieldsPtrs& f, const SimParams& p,
     k_exchange<<<gd3(p.Nx,p.Ny,p.Nz), bd3(), 0, s>>>(f, p,
                shift_z, map_slot, num_maps);
 }
+
+void launch_mass_sum_plasma_mbuf(GridFieldsPtrs& f, const SimParams& p, double* d_out,
+                                 cudaStream_t s) {
+    cudaMemsetAsync(d_out, 0, sizeof(double), s);
+    int N = p.Nx * p.Ny * p.Nz;
+    const int bs = 256;
+    int nb = (N + bs - 1) / bs;
+    k_sum_mass_plasma_mbuf<<<nb, bs, 0, s>>>(f, p, d_out);
+}
+
+void launch_apply_mass_fp_fix(GridFieldsPtrs& f, const SimParams& p,
+                              double* d_sum_ref, double* d_sum_cur, cudaStream_t s) {
+    int N = p.Nx * p.Ny * p.Nz;
+    const int bs = 256;
+    int nb = (N + bs - 1) / bs;
+    k_apply_mass_fp_fix<<<nb, bs, 0, s>>>(f, p, d_sum_ref, d_sum_cur);
+}
+
 void launch_tensor_step(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s) {
     k_tensor<<<gd3(p.Nx,p.Ny,p.Nz), bd3(), 0, s>>>(f, p);
 }

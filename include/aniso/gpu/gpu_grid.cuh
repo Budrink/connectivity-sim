@@ -15,6 +15,9 @@ class GpuGrid {
     SimParams       params_{};
     GlobalMetrics   host_metrics_{};
     GlobalMetrics*  d_metrics_ = nullptr;
+    float           host_wall_q_sink_last_frame_ = 0.f;
+    double*         d_mass_sum_ = nullptr;   // temp for Σm_buf (plasma)
+    double*         d_mass_ref_ = nullptr;   // Σm_buf after prepare (reference for FP fix)
 
     int total_ = 0;
     bool initialized_ = false;
@@ -26,6 +29,7 @@ class GpuGrid {
     std::vector<float> h_J_mag_;
     std::vector<float> h_B_mag_;
     std::vector<float> h_J_vis_;   // 3 * N cells (RGB packed J dir + |J|)
+    std::vector<float> h_q_;
 
     // Kawasaki pair map (CPU build may run async; upload on main thread after join)
     std::vector<unsigned char> h_pair_map_;
@@ -100,6 +104,7 @@ public:
     const float* h_J_mag()       const { return h_J_mag_.data(); }
     const float* h_B_mag()       const { return h_B_mag_.data(); }
     const float* h_J_vis()       const { return h_J_vis_.data(); }
+    const float* h_q()          const { return h_q_.data(); }
     bool has_equilibrium()       const { return eq_loaded_; }
 
     const GlobalMetrics& metrics() const { return host_metrics_; }
