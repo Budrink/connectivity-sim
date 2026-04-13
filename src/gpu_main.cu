@@ -27,6 +27,23 @@ static ImU32 hot(float v) {
     float b = fminf(fmaxf((v-0.67f)*3.0f, 0.0f), 1.0f);
     return IM_COL32((int)(r*255),(int)(g*255),(int)(b*255),255);
 }
+// Mass viz: dark blue → teal → yellow-green (matches 3D TF); linear t in [0,1]
+static ImU32 mass_bluegreen(float v) {
+    v = fminf(fmaxf(v, 0.0f), 1.0f);
+    float r, g, b;
+    if (v < 0.52f) {
+        float t = v / 0.52f;
+        r = 0.02f + 0.10f * t;
+        g = 0.07f + 0.52f * t;
+        b = 0.20f + 0.72f * t;
+    } else {
+        float t = (v - 0.52f) / 0.48f;
+        r = 0.12f + 0.30f * t;
+        g = 0.59f + 0.36f * t;
+        b = 0.92f - 0.55f * t;
+    }
+    return IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
+}
 // Signed charge: t in [0,1], t=0.5 → q=0. Max negative → deep red; neutral → black; positive → white.
 static ImU32 charge_signed_rbkw(float t) {
     t = fminf(fmaxf(t, 0.0f), 1.0f);
@@ -45,26 +62,11 @@ static ImU32 charge_signed_rbkw(float t) {
     return IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
 }
 
-// Mass viz tuning (sliders in Controls); ln map vs peak, then γ>1 to tame bright top (hot colormap)
-static float g_mass_viz_floor_frac = 3e-6f;
-static float g_mass_viz_gamma = 1.22f;
-// Charge 2D + 3D: |q| / (max|q| in plasma * this) before clamp → full rbkw / TF (otherwise almost all cells sit at q≈0 → black).
+// Charge 2D + 3D: |q| / (max|q| in plasma * this) before clamp → full rbkw / TF.
 static float g_charge_viz_peak_frac = 0.032f;
-// After linear scale, γ<1 lifts mid-range |q| away from neutral black.
 static float g_charge_viz_gamma = 0.78f;
 
-static float mass_viz_norm_log(float m, float linear_hi) {
-    float hi = fmaxf(linear_hi, 1e-20f);
-    float base = fmaxf(hi * g_mass_viz_floor_frac, 1e-18f);
-    float u = logf(fmaxf(m, 0.f) + base);
-    float u0 = logf(base);
-    float u1 = logf(hi + base);
-    float t = (u - u0) / fmaxf(u1 - u0, 1e-20f);
-    t = fminf(fmaxf(t, 0.f), 1.f);
-    t = powf(t, g_mass_viz_gamma);
-    return fminf(fmaxf(t, 0.f), 1.f);
-}
-
+// Heuristics for status bar + auto-pause (hard_disruption). Not part of GPU physics.
 struct DisruptionTracker {
     bool   disruption_active = false;
     bool   hard_disruption = false;
@@ -72,18 +74,18 @@ struct DisruptionTracker {
     float  disruption_timer = 0;
 
     int    warmup_steps = 5000;
-    int    step_counter = 0;
 
     float  wf_ema = -1.0f;
+    /// total_wall_flux > wf_spike_ratio * wf_ema → soft "spike" (may recover).
     float  wf_spike_ratio = 2.0f;
+    /// While in soft spike: flux > wf_hard_ratio * ema (or wall/beta) → pause sim.
     float  wf_hard_ratio  = 4.0f;
-    float  conf_collapse  = 1.5f;
 
     static constexpr int TREND_N = 8;
     float  conf_window[TREND_N] = {};
     int    conf_idx = 0;
     int    conf_filled = 0;
-    int    trend_sample_every = 200;
+    static constexpr int kTrendSampleSteps = 200;
     int    trend_counter = 0;
     float  conf_peak = 0;
 
@@ -92,7 +94,7 @@ struct DisruptionTracker {
     const SimParams* grid_params_ptr = nullptr;
     void update(const GlobalMetrics& m, float dt, int steps_done = 1) {
         const SimParams& gp = *grid_params_ptr;
-        step_counter = gp.step_count;
+        const int step_n = gp.step_count;
 
         float wf = m.total_wall_flux;
         if (wf_ema < 0) wf_ema = wf;
@@ -107,7 +109,7 @@ struct DisruptionTracker {
             return;
         }
 
-        if (step_counter < warmup_steps) {
+        if (step_n < warmup_steps) {
             status_text = "Warmup";
             return;
         }
@@ -115,7 +117,7 @@ struct DisruptionTracker {
         conf_peak = fmaxf(conf_peak, m.confinement);
 
         trend_counter += steps_done;
-        if (trend_counter >= trend_sample_every) {
+        if (trend_counter >= kTrendSampleSteps) {
             trend_counter = 0;
             conf_window[conf_idx % TREND_N] = m.confinement;
             conf_idx++;
@@ -151,6 +153,7 @@ struct DisruptionTracker {
                 status_text = "WALL CONTACT";
             } else if (spike) {
                 disruption_active = true; disruption_timer = 0;
+                hard_disruption = false;
                 status_text = "Wall flux spike";
             } else if (degrading) {
                 status_text = "DEGRADING";
@@ -167,13 +170,14 @@ struct DisruptionTracker {
             }
             if (!hard_disruption && wf < wf_ema * 1.2f && disruption_timer > 0.5f) {
                 disruption_active = false;
+                disruption_timer = 0;
             }
         }
     }
 
     void reset() {
         disruption_active = false; hard_disruption = false; degrading = false;
-        disruption_timer = 0; step_counter = 0;
+        disruption_timer = 0;
         wf_ema = -1.0f; conf_idx = 0; conf_filled = 0;
         trend_counter = 0; conf_peak = 0; status_text = "Warmup";
     }
@@ -523,7 +527,7 @@ struct OrbitCamera {
 
 struct VolumeRenderer {
     GLuint prog = 0, vao = 0;
-    GLuint vol_tex = 0, tf_tex = 0;
+    GLuint vol_tex = 0, tf_tex = 0, tf_tex_mass = 0;
     GLuint fbo = 0, fbo_col = 0, fbo_dep = 0;
     int fbo_w = 0, fbo_h = 0;
     int vnx = 0, vny = 0, vnz = 0;
@@ -578,8 +582,29 @@ struct VolumeRenderer {
         return true;
     }
 
+    static void fill_tf_row_mass(float v, unsigned char* px) {
+        float r, g, b;
+        if (v < 0.52f) {
+            float t = v / 0.52f;
+            r = 0.02f + 0.10f * t;
+            g = 0.07f + 0.52f * t;
+            b = 0.20f + 0.72f * t;
+        } else {
+            float t = (v - 0.52f) / 0.48f;
+            r = 0.12f + 0.30f * t;
+            g = 0.59f + 0.36f * t;
+            b = 0.92f - 0.55f * t;
+        }
+        float a = v * v;
+        px[0] = (unsigned char)(r * 255);
+        px[1] = (unsigned char)(g * 255);
+        px[2] = (unsigned char)(b * 255);
+        px[3] = (unsigned char)(a * 255);
+    }
+
     void build_tf() {
         if (tf_tex) glDeleteTextures(1, &tf_tex);
+        if (tf_tex_mass) glDeleteTextures(1, &tf_tex_mass);
         glGenTextures(1, &tf_tex);
         glBindTexture(GL_TEXTURE_1D, tf_tex);
         unsigned char tf[256 * 4];
@@ -593,6 +618,17 @@ struct VolumeRenderer {
             tf[i*4+1] = (unsigned char)(g*255);
             tf[i*4+2] = (unsigned char)(b*255);
             tf[i*4+3] = (unsigned char)(a*255);
+        }
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA8, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, tf);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+
+        glGenTextures(1, &tf_tex_mass);
+        glBindTexture(GL_TEXTURE_1D, tf_tex_mass);
+        for (int i = 0; i < 256; i++) {
+            float v = i / 255.0f;
+            fill_tf_row_mass(v, tf + i * 4);
         }
         glTexImage1D(GL_TEXTURE_1D, 0, GL_RGBA8, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, tf);
         glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -665,7 +701,7 @@ struct VolumeRenderer {
 
     GLuint render(int w, int h, const OrbitCamera& cam, float opacity, float lo, float hi,
                   float wall_radius = 0.45f, float wall_alpha = 0.3f, int color_mode = 0,
-                  int scalar_tf_mode = 0) {
+                  int scalar_tf_mode = 0, bool use_mass_transfer = false) {
         if (!vol_tex || !prog) return 0;
         ensure_fbo(w, h);
 
@@ -706,7 +742,7 @@ struct VolumeRenderer {
         glBindTexture(GL_TEXTURE_3D, vol_tex);
         glUniform1i(u_vol_tex, 0);
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_1D, tf_tex);
+        glBindTexture(GL_TEXTURE_1D, (use_mass_transfer && tf_tex_mass) ? tf_tex_mass : tf_tex);
         glUniform1i(u_tf_tex, 1);
 
         glBindVertexArray(vao);
@@ -723,7 +759,8 @@ struct VolumeRenderer {
         if (prog)    { glDeleteProgram(prog);              prog = 0; }
         if (vao)     { glDeleteVertexArrays(1, &vao);      vao = 0; }
         if (vol_tex) { glDeleteTextures(1, &vol_tex);      vol_tex = 0; }
-        if (tf_tex)  { glDeleteTextures(1, &tf_tex);       tf_tex = 0; }
+        if (tf_tex)       { glDeleteTextures(1, &tf_tex);       tf_tex = 0; }
+        if (tf_tex_mass)  { glDeleteTextures(1, &tf_tex_mass);  tf_tex_mass = 0; }
         if (fbo)     { glDeleteFramebuffers(1, &fbo);      fbo = 0; }
         if (fbo_col) { glDeleteTextures(1, &fbo_col);      fbo_col = 0; }
         if (fbo_dep) { glDeleteRenderbuffers(1, &fbo_dep);  fbo_dep = 0; }
@@ -735,15 +772,11 @@ struct VolumeRenderer {
 // ============================================================
 static void draw_heatmap_slice(const char* label, const float* data,
                                int Nx, int Ny, int Nz, int z_slice,
-                               ImU32 (*cmap)(float), float lo, float hi, float sz,
-                               bool mass_log_scale = false) {
+                               ImU32 (*cmap)(float), float lo, float hi, float sz) {
     ImGui::BeginChild(label, ImVec2(sz+20, sz+52), true);
     ImGui::Text("%s  z=%d/%d", label, z_slice, Nz);
     ImVec4 cap_col(0.78f, 0.78f, 0.80f, 1.f);
-    if (mass_log_scale)
-        ImGui::TextColored(cap_col, "hot (log ln)  sparse→dark  m_peak≈%.3g", (double)hi);
-    else
-        ImGui::TextColored(cap_col, "colormap [%.3g, %.3g]", (double)lo, (double)hi);
+    ImGui::TextColored(cap_col, "colormap [%.3g, %.3g]", (double)lo, (double)hi);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
 
     int step = 1;
@@ -759,8 +792,8 @@ static void draw_heatmap_slice(const char* label, const float* data,
     for (int mj = 0; mj < mapH; ++mj) {
         int si = mi*step, sj = mj*step;
         float raw = data[(si * Ny + sj) * Nz + zk];
-        float v = mass_log_scale ? mass_viz_norm_log(raw, hi)
-                                 : (raw - lo) / range;
+        float v = (raw - lo) / range;
+        v = fminf(fmaxf(v, 0.f), 1.f);
         ImU32 col = cmap(v);
         float x0 = p0.x + mi*cs, y0 = p0.y + mj*cs;
         dl->AddRectFilled(ImVec2(x0,y0), ImVec2(x0+cs+1,y0+cs+1), col);
@@ -922,7 +955,7 @@ int main(int argc, char** argv) {
     DisruptionTracker dtrack;
     dtrack.grid_params_ptr = &grid.params();
 
-    bool paused = false;
+    bool paused = true;
     int steps_per_frame = 4;
     int readback_every = 2;
     int frame_counter = 0;
@@ -946,7 +979,6 @@ int main(int argc, char** argv) {
     int   z_slice = 0;
     int   vol_display_nz = 32;
     std::vector<float> vol_em_;
-    std::vector<float> mass_vol_norm_;
     std::vector<float> vol_J_filtered_;
     std::vector<float> vol_charge_vis_;
 
@@ -1003,14 +1035,7 @@ int main(int argc, char** argv) {
             const float* vol_src = grid.h_E();
             int vol_tex_ch = 1;
             if (vol_data_mode == 1) {
-                int nt = Nx * Ny * Nz;
-                if ((int)mass_vol_norm_.size() != nt)
-                    mass_vol_norm_.resize((size_t)nt);
-                const float* hm = grid.h_mass();
-                float hic = mass_col_hi;
-                for (int i = 0; i < nt; ++i)
-                    mass_vol_norm_[i] = mass_viz_norm_log(hm[i], hic);
-                vol_src = mass_vol_norm_.data();
+                vol_src = grid.h_mass();
             } else if (vol_data_mode == 2) {
                 int nt = Nx * Ny * Nz;
                 if ((int)vol_em_.size() != nt)
@@ -1116,7 +1141,7 @@ int main(int argc, char** argv) {
                 if (dtrack.hard_disruption)           col = IM_COL32(255,0,0,255);
                 else if (dtrack.disruption_active)    col = IM_COL32(255,180,50,255);
                 else if (dtrack.degrading)            col = IM_COL32(255,120,120,255);
-                else if (dtrack.step_counter < dtrack.warmup_steps) col = IM_COL32(180,180,255,255);
+                else if ((int)grid.params().step_count < dtrack.warmup_steps) col = IM_COL32(180,180,255,255);
                 else                                  col = IM_COL32(80,255,80,255);
                 ImGui::PushStyleColor(ImGuiCol_Text, col);
                 ImGui::Text("[%s]  wf:%.1f  ema:%.1f  conf:%.1f/%.1f",
@@ -1141,7 +1166,7 @@ int main(int argc, char** argv) {
                 paused = !paused;
             }
             ImGui::SameLine();
-            if (ImGui::Button("Reset")) { grid.reset(); ts = TimeSeries(4000); dtrack.reset(); paused = false; }
+            if (ImGui::Button("Reset")) { grid.reset(); ts = TimeSeries(4000); dtrack.reset(); paused = true; }
             ImGui::SameLine();
             if (ImGui::Button("Step")) { grid.step(); }
 
@@ -1151,11 +1176,16 @@ int main(int argc, char** argv) {
             auto& pp = grid.params();
 
             ImGui::Separator(); ImGui::Text("Plasma Medium");
-            ImGui::SliderFloat("cord_radius", &pp.cord_radius, 0.1f, 1.0f, "%.2f");
-            ImGui::SliderFloat("cord_mass", &pp.cord_mass, 0.01f, 10.0f, "%.2f");
+            ImGui::SliderFloat("cord_radius (outer R)", &pp.cord_radius, 0.1f, 1.0f, "%.2f");
+            ImGui::SliderFloat("cord_mass (mean / cell in R)", &pp.cord_mass, 0.01f, 10.0f, "%.2f");
+            ImGui::SliderFloat("cord cx", &pp.cord_cx, 0.0f, 1.0f);
+            ImGui::SliderFloat("cord cy", &pp.cord_cy, 0.0f, 1.0f);
+            ImGui::SliderFloat("cord mass noise", &pp.cord_mass_noise, 0.0f, 1.0f, "%.3f");
+            ImGui::SliderFloat("cord xy wander (z)", &pp.cord_xy_wander, 0.0f, 0.25f, "%.3f");
+            ImGui::TextDisabled("Random m in r<R, Σm=cord_mass*N_cells_in_R; wander+noise in weights. Reset.");
             ImGui::SliderFloat("m0 (accept)", &pp.m0, 0.01f, 5.0f, "%.2f");
-            ImGui::SliderFloat("m_ref", &pp.m_ref, 0.01f, 10.0f, "%.2f");
-            ImGui::SliderFloat("alpha_m", &pp.alpha_m, 0.0f, 3.0f, "%.2f");
+            ImGui::SliderFloat("alpha_m (Sab mass)", &pp.alpha_m, 0.0f, 3.0f, "%.2f");
+            ImGui::SliderFloat("alpha_e (Sab energy)", &pp.alpha_e, 0.0f, 3.0f, "%.2f");
             {
                 bool mfp = pp.mass_fp_fix != 0;
                 if (ImGui::Checkbox("Mass FP fix (Σm after exchange)", &mfp))
@@ -1196,37 +1226,35 @@ int main(int argc, char** argv) {
                 }
                 ImGui::SliderFloat("Heat cx", &pp.heat_cx, 0.0f, 1.0f);
                 ImGui::SliderFloat("Heat cy", &pp.heat_cy, 0.0f, 1.0f);
-                ImGui::SliderFloat("Heat cz", &pp.heat_cz, 0.0f, 1.0f);
                 ImGui::SliderFloat("Heat rx", &pp.heat_rx, 0.01f, 0.5f);
                 ImGui::SliderFloat("Heat ry", &pp.heat_ry, 0.01f, 0.5f);
-                ImGui::SliderFloat("Heat rz", &pp.heat_rz, 0.01f, 0.5f);
                 ImGui::SliderFloat("Heat peak", &pp.heat_peak, 0.0f, 5.0f);
+                ImGui::TextDisabled("heat_cz/rz: init & heat_profile only; Qh uses xy Gaussian (see YAML).");
             }
             ImGui::SliderFloat("Response tau", &pp.heater_response_tau, 0.0f, 5.0f, "%.3f");
             ImGui::SliderFloat("Absorption E_abs", &pp.heat_E_abs, 0.0f, 50.0f, "%.1f");
             if (pp.heat_E_abs > 0.0f)
                 ImGui::Text("  Q factor at E=1: %.2f", 1.0f/(1.0f + 1.0f/pp.heat_E_abs));
 
-            ImGui::Separator(); ImGui::Text("Tensor S  (S = E/E_ref + kappa * grad E x grad E / E_ref^2)");
+            ImGui::Separator(); ImGui::Text("Sab / S clamp (k_exchange, k_prepare)");
             ImGui::SliderFloat("kappa (aniso)", &pp.grad_kappa, 0.0f, 50.0f);
             ImGui::SliderFloat("E_ref", &pp.grad_E_ref, 0.1f, 10.0f);
             ImGui::SliderFloat("eig_lo", &pp.eig_lo, 0.01f, 5.0f, "%.2f");
             ImGui::SliderFloat("eig_hi (cap)", &pp.eig_hi, 100.0f, 1e4f, "%.0f");
-            ImGui::SliderFloat("l0 (scale)", &pp.l0, 0.01f, 5.0f, "%.3f");
-            ImGui::SliderFloat("alpha (power)", &pp.res_alpha, 0.0f, 2.0f, "%.2f");
+            ImGui::SliderFloat("l0 (Sab scale)", &pp.l0, 0.01f, 5.0f, "%.3f");
 
             if (pp.Nz > 1) {
                 ImGui::Separator(); ImGui::Text("Self-consistent B-field");
                 ImGui::SliderInt("field update N", &pp.field_update_every, 0, 100);
                 if (pp.field_update_every > 0) {
-                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, 0.0f, 10.0f, "%.3f");
+                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, 0.0f, 1000.0f, "%.3f");
                     ImGui::SliderFloat("Bz_ext", &pp.Bz_ext, 0.0f, 50.0f, "%.2f");
                     ImGui::SliderFloat("charge_mass_scale", &pp.charge_mass_scale, 0.0f, 5.0f, "%.2f");
                     ImGui::SliderFloat("charge R0", &pp.charge_R0, 0.01f, 50.0f, "%.2f");
                     ImGui::SliderFloat("charge_j_scale", &pp.charge_j_scale, 1e-6f, 10.0f, "%.5f");
                     ImGui::TextDisabled("J = j_acc * j_scale / (fe*dt*face); calibrates |B| from MC charge hops");
                     ImGui::SliderFloat("inv_aspect (a/R0)", &pp.inv_aspect_ratio, 0.0f, 10.0f, "%.2f");
-                    ImGui::SliderFloat("C0 (cent, inner x)", &pp.cent_C0, 0.1f, 5.0f, "%.2f");
+                    ImGui::SliderFloat("C0 (C_mid inner x)", &pp.cent_C0, 0.1f, 5.0f, "%.2f");
                     ImGui::SliderInt("SOR iters", &pp.poisson_iters, 5, 2000);
                     ImGui::SliderFloat("SOR omega", &pp.sor_omega, 1.0f, 1.95f, "%.2f");
                 }
@@ -1234,17 +1262,24 @@ int main(int argc, char** argv) {
                             grid.metrics().Ip_total / fmaxf((float)pp.Nz, 1.0f));
             }
 
-            ImGui::Separator(); ImGui::Text("Beta / Disruption");
-            ImGui::SliderFloat("beta_limit", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
-            ImGui::SliderFloat("spike_ratio", &dtrack.wf_spike_ratio, 1.5f, 10.0f, "%.1f");
-            ImGui::SliderInt("warmup", &dtrack.warmup_steps, 0, 20000);
+            ImGui::Separator(); ImGui::Text("Thermal quench (physics)");
+            ImGui::SliderFloat("beta_limit (center_E)", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
+            ImGui::TextDisabled("0 = off. Exceeding pauses sim (hard) via metrics center_E.");
+
+            ImGui::Separator(); ImGui::Text("Disruption heuristics (auto-pause)");
+            ImGui::SliderFloat("Wall flux soft (x EMA)", &dtrack.wf_spike_ratio, 1.2f, 10.0f, "%.1f");
+            ImGui::SliderFloat("Wall flux hard (x EMA)", &dtrack.wf_hard_ratio, 2.0f, 16.0f, "%.1f");
+            ImGui::SliderInt("Warmup steps (no alerts)", &dtrack.warmup_steps, 0, 20000);
+            ImGui::TextDisabled(
+                "Soft spike: flux > soft×EMA. Hard pause: flux > hard×EMA, or wall melt/contact, "
+                "or beta. Soft can clear if flux < 1.2×EMA ~0.5s sim time. NaN/overflow always hard.");
 
             if (grid.has_equilibrium()) {
                 ImGui::Separator(); ImGui::Text("Equilibrium");
                 bool eq_on = pp.use_equilibrium != 0;
                 if (ImGui::Checkbox("Use Equilibrium", &eq_on)) {
                     pp.use_equilibrium = eq_on ? 1 : 0;
-                    grid.reset();
+                    grid.reset(true);
                     ts = TimeSeries(4000); dtrack.reset();
                 }
                 
@@ -1300,13 +1335,10 @@ int main(int argc, char** argv) {
             }
 
             ImGui::Separator();
-            ImGui::Text("Mass (2D + vol): hot colormap, log vs peak → sparse dark");
+            ImGui::Text("Mass (2D + vol): blue-green, linear [0, m_max]");
             ImGui::Checkbox("Mass autoscale", &mass_viz_autoscale);
             if (!mass_viz_autoscale)
-                ImGui::SliderFloat("Mass linear peak (m_max)", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
-            ImGui::SliderFloat("Mass log floor (frac of peak)", &g_mass_viz_floor_frac,
-                               1e-8f, 2e-4f, "%.2e", ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderFloat("Mass viz gamma (top soften)", &g_mass_viz_gamma, 1.0f, 2.2f, "%.2f");
+                ImGui::SliderFloat("Mass m_max (color scale)", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
 
             ImGui::Separator();
             ImGui::Text("Charge (3D volume mode only; same TF as Energy)");
@@ -1367,8 +1399,8 @@ int main(int argc, char** argv) {
                 ImGui::BeginGroup();
                 draw_heatmap_slice("Energy (E)", edata, Nx, Ny, Nz, z_slice, hot, 0, E_scale, map_size);
                 ImGui::SameLine(0.f, 8.f);
-                draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, hot, 0.f,
-                                   mass_col_hi, map_size, true);
+                draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, mass_bluegreen, 0.f,
+                                   mass_col_hi, map_size);
                 ImGui::SameLine(0.f, 8.f);
                 draw_heatmap_slice("|grad E|^2", gEdata, Nx, Ny, Nz, z_slice, hot, 0, gradE_scale, map_size);
                 ImGui::SameLine(0.f, 8.f);
@@ -1388,7 +1420,7 @@ int main(int argc, char** argv) {
                 float vol_lo = 0.0f;
                 if (vol_data_mode == 1) {
                     vol_lo = 0.0f;
-                    vol_hi = 1.0f;
+                    vol_hi = fmaxf(mass_col_hi, 1e-10f);
                 } else if (vol_data_mode == 2)
                     vol_hi = fmaxf(vol_em_max, 0.1f);
                 else if (vol_data_mode == 3)
@@ -1405,7 +1437,8 @@ int main(int argc, char** argv) {
                 GLuint vtex = vol_renderer.render(vw, vh, orbit_cam,
                                                   vol_opacity, vol_lo, vol_hi,
                                                   grid.params().wall_radius, wall_tube_alpha,
-                                                  vol_color_mode, vol_scalar_tf);
+                                                  vol_color_mode, vol_scalar_tf,
+                                                  vol_data_mode == 1);
                 if (vtex) {
                     ImGui::Image((ImTextureID)(intptr_t)vtex,
                                  ImVec2((float)vw, (float)vh),

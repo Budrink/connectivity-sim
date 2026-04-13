@@ -18,6 +18,7 @@ class GpuGrid {
     float           host_wall_q_sink_last_frame_ = 0.f;
     double*         d_mass_sum_ = nullptr;   // temp for Σm_buf (plasma)
     double*         d_mass_ref_ = nullptr;   // Σm_buf after prepare (reference for FP fix)
+    unsigned int*   d_mass_support_cnt_ = nullptr; // cord init: cells inside r<R (for Σm target)
 
     int total_ = 0;
     bool initialized_ = false;
@@ -63,10 +64,11 @@ public:
 
     bool load_equilibrium(const std::string& bin_path);
     void init(const SimParams& p);
-    void reset();
+    /// Resets fields and time; by default keeps Kawasaki pair maps (built once in init).
+    void reset(bool rebuild_pair_maps = false);
     /// Non-blocking: if CPU build finished, upload to GPU and return true.
     bool poll_pair_maps();
-    /// Block until pair maps are on GPU (use after init/reset in non-GUI code).
+    /// Block until pair maps are on GPU (use after init in non-GUI code).
     void wait_pair_maps();
     bool pair_maps_ready() const { return pair_maps_gpu_ready_; }
     /// 0..1 while CPU build runs; 1 when maps are on GPU.

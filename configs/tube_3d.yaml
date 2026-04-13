@@ -1,14 +1,13 @@
 # 3D tube with self-consistent B-field
-# 128x128 cross-section, 32 axial layers, periodic z (toroidal)
+# 64x64x128, periodic z (toroidal)
 
 grid:
-  Nx: 128
-  Ny: 128
-  Nz: 32
+  Nx: 64
+  Ny: 64
+  Nz: 128
   wall_radius: 0.45
   tube_length: 1.0
   wall_z_periodic: 1
-  num_pair_maps: 32
   g_noise_init: 0.05
   heat_profile:
     cx: 0.5
@@ -41,7 +40,12 @@ g_response:
 
 medium:
   cord_radius: 0.2
-  cord_mass: 1.0
+  cord_profile_frac: 0.42  # unused (kept for YAML compat)
+  cord_mass: 1.0            # target mean mass per cell inside r<R; actual Σm = cord_mass * N_support
+  cord_cx: 0.5      # cylinder axis x in normalized grid coords (0..1), like heater cx
+  cord_cy: 0.5
+  cord_mass_noise: 0.12   # multiplicative on Gaussian m per cell
+  cord_xy_wander: 0.07    # axis xy offset vs z (normalized); smoothed along k
   m0: 0.5
   m_ref: 1.0
   alpha_m: 1.0
@@ -66,6 +70,7 @@ field:
   sor_omega: 1.7
   inv_aspect_ratio: 0.1
   cent_C0: 1.0
+  cent_bias_cterm: 1.0
 
 charge:
   mass_scale: 1.0

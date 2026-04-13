@@ -5,7 +5,7 @@
 
 // SoA field pointers — all arrays have size Nx*Ny*Nz
 struct GridFieldsPtrs {
-    // Energy (double-buffered)
+    // Energy (double-buffered: E <-> E_buf)
     float *E, *E_buf;
 
     // Mass (double-buffered)
@@ -52,6 +52,9 @@ struct GridFieldsPtrs {
 
     // Kawasaki pair map (one byte per cell: direction code, 13 = no pair)
     unsigned char *pair_map;
+
+    // Cbias uses prior-step values; owner thread writes both endpoints after MC (non-overlapping pairs).
+    float *mass_shift;
 
     // Single float: atomicAdd Σ|dq| (plasma→wall) between GpuGrid drain snapshots
     float *wall_q_sink_accum;
@@ -105,6 +108,9 @@ struct GlobalMetrics {
 // ---- Kernel launch wrappers ----
 
 void launch_init_fields(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
+/// After k_init: random cord weights in m_buf inside r<R, then rescale so Σm = cord_mass * N_support.
+void launch_init_cord_mass_random(GridFieldsPtrs& f, const SimParams& p,
+                                  double* d_sum_w, unsigned int* d_cnt, cudaStream_t s = 0);
 void launch_update_delayed_S(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 void launch_prepare_step(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 // shift_z applies only when wall_z_periodic && Nz>1 (toroidal z); map_slot in [0, num_maps) (from SimParams::num_pair_maps)

@@ -8,7 +8,6 @@ grid:
   wall_radius: 0.45
   tube_length: 1.0
   wall_z_periodic: 1
-  num_pair_maps: 32
   g_noise_init: 0.05
   heat_profile:
     cx: 0.5
@@ -66,6 +65,7 @@ field:
   sor_omega: 1.7
   inv_aspect_ratio: 0.1
   cent_C0: 1.0
+  cent_bias_cterm: 1.0
 
 charge:
   mass_scale: 1.0

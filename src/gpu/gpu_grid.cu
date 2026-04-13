@@ -147,6 +147,8 @@ void GpuGrid::alloc_all() {
     CK(cudaMalloc(&fields_.wall_q_sink_accum, sizeof(float)));
     CK(cudaMalloc(&fields_.rad_step_accum, sizeof(float)));
 
+    af(&fields_.mass_shift);
+
     af(&fields_.rb_E); af(&fields_.rb_mass);
     af(&fields_.rb_aniso); af(&fields_.rb_aniso_angle);
     af(&fields_.rb_wall_flux); af(&fields_.rb_gradE_sq);
@@ -159,6 +161,7 @@ void GpuGrid::alloc_all() {
     CK(cudaMalloc(&d_metrics_, sizeof(GlobalMetrics)));
     CK(cudaMalloc(&d_mass_sum_, sizeof(double)));
     CK(cudaMalloc(&d_mass_ref_, sizeof(double)));
+    CK(cudaMalloc(&d_mass_support_cnt_, sizeof(unsigned int)));
 
     h_E_.resize(n); h_mass_.resize(n);
     h_aniso_.resize(n); h_aniso_angle_.resize(n);
@@ -200,6 +203,8 @@ void GpuGrid::free_all() {
     ff(fields_.wall_q_sink_accum);
     ff(fields_.rad_step_accum);
 
+    ff(fields_.mass_shift);
+
     ff(fields_.rb_E); ff(fields_.rb_mass);
     ff(fields_.rb_aniso); ff(fields_.rb_aniso_angle);
     ff(fields_.rb_wall_flux); ff(fields_.rb_gradE_sq);
@@ -212,8 +217,10 @@ void GpuGrid::free_all() {
     if (d_metrics_) cudaFree(d_metrics_);
     if (d_mass_sum_) cudaFree(d_mass_sum_);
     if (d_mass_ref_) cudaFree(d_mass_ref_);
+    if (d_mass_support_cnt_) cudaFree(d_mass_support_cnt_);
     d_mass_sum_ = nullptr;
     d_mass_ref_ = nullptr;
+    d_mass_support_cnt_ = nullptr;
     std::memset(&fields_, 0, sizeof(fields_));
     d_metrics_ = nullptr;
 }
@@ -454,7 +461,7 @@ void GpuGrid::init(const SimParams& p) {
     if (initialized_) free_all();
     params_ = p;
     total_ = p.Nx * p.Ny * p.Nz;
-    params_.num_pair_maps = clamp_num_pair_maps(params_.num_pair_maps);
+    params_.num_pair_maps = clamp_num_pair_maps(params_.Nz);
     params_.t = 0; params_.step_count = 0;
     params_.seed = (unsigned long long)
         std::chrono::high_resolution_clock::now().time_since_epoch().count();
@@ -519,6 +526,7 @@ void GpuGrid::init(const SimParams& p) {
     if (eq_loaded_ && params_.use_equilibrium)
         upload_equilibrium();
     launch_init_fields(fields_, params_, stream_);
+    launch_init_cord_mass_random(fields_, params_, d_mass_sum_, d_mass_support_cnt_, stream_);
     if (params_.Nz > 1 && params_.field_update_every > 0)
         launch_update_bfield(fields_, params_, stream_);
     CK(cudaStreamSynchronize(stream_));
@@ -538,15 +546,17 @@ void GpuGrid::init(const SimParams& p) {
     initialized_ = true;
 }
 
-void GpuGrid::reset() {
+void GpuGrid::reset(bool rebuild_pair_maps) {
     params_.t = 0; params_.step_count = 0;
     params_.seed = (unsigned long long)
         std::chrono::high_resolution_clock::now().time_since_epoch().count();
     launch_init_fields(fields_, params_, stream_);
+    launch_init_cord_mass_random(fields_, params_, d_mass_sum_, d_mass_support_cnt_, stream_);
     if (params_.Nz > 1 && params_.field_update_every > 0)
         launch_update_bfield(fields_, params_, stream_);
     CK(cudaStreamSynchronize(stream_));
-    start_pair_map_build_async();
+    if (rebuild_pair_maps)
+        start_pair_map_build_async();
 }
 
 void GpuGrid::swap_buffers() {
@@ -565,21 +575,6 @@ void GpuGrid::swap_buffers() {
 void GpuGrid::step() {
     if (!pair_maps_gpu_ready_)
         return;
-    // j_acc (exchange) → J → ∇²A_i = -J_i → B = curl A + B_ext → eq_b* for transport
-    if (params_.Nz > 1 && params_.field_update_every > 0 && params_.step_count > 0 &&
-        params_.step_count % params_.field_update_every == 0) {
-        launch_fill_J_from_charge_accum(fields_, params_, stream_);
-        for (int it = 0; it < params_.poisson_iters; it++) {
-            launch_poisson_sor(fields_, params_, 0, fields_.Jx, fields_.Ax, stream_);
-            launch_poisson_sor(fields_, params_, 1, fields_.Jx, fields_.Ax, stream_);
-            launch_poisson_sor(fields_, params_, 0, fields_.Jy, fields_.Ay, stream_);
-            launch_poisson_sor(fields_, params_, 1, fields_.Jy, fields_.Ay, stream_);
-            launch_poisson_sor(fields_, params_, 0, fields_.Jz, fields_.Az, stream_);
-            launch_poisson_sor(fields_, params_, 1, fields_.Jz, fields_.Az, stream_);
-        }
-        launch_update_bfield(fields_, params_, stream_);
-        launch_clear_j_accum(fields_, params_, stream_);
-    }
 
     launch_update_delayed_S(fields_, params_, stream_);
 
@@ -609,6 +604,23 @@ void GpuGrid::step() {
 
     if (params_.mass_fp_fix)
         launch_apply_mass_fp_fix(fields_, params_, d_mass_ref_, d_mass_sum_, stream_);
+
+    // After this step's exchange, j_acc includes transport for step (step_count+1); Poisson every field_update_every.
+    const int sc_next = params_.step_count + 1;
+    if (params_.Nz > 1 && params_.field_update_every > 0 && sc_next > 0 &&
+        sc_next % params_.field_update_every == 0) {
+        launch_fill_J_from_charge_accum(fields_, params_, stream_);
+        for (int it = 0; it < params_.poisson_iters; it++) {
+            launch_poisson_sor(fields_, params_, 0, fields_.Jx, fields_.Ax, stream_);
+            launch_poisson_sor(fields_, params_, 1, fields_.Jx, fields_.Ax, stream_);
+            launch_poisson_sor(fields_, params_, 0, fields_.Jy, fields_.Ay, stream_);
+            launch_poisson_sor(fields_, params_, 1, fields_.Jy, fields_.Ay, stream_);
+            launch_poisson_sor(fields_, params_, 0, fields_.Jz, fields_.Az, stream_);
+            launch_poisson_sor(fields_, params_, 1, fields_.Jz, fields_.Az, stream_);
+        }
+        launch_update_bfield(fields_, params_, stream_);
+        launch_clear_j_accum(fields_, params_, stream_);
+    }
 
     launch_tensor_step(fields_, params_, stream_);
     swap_buffers();
@@ -723,10 +735,16 @@ SimParams default_sim_params() {
     p.t = 0; p.step_count = 0;
 
     p.cord_radius = 0.2f;
+    p.cord_profile_frac = 0.42f;
     p.cord_mass = 1.0f;
+    p.cord_cx = 0.5f;
+    p.cord_cy = 0.5f;
+    p.cord_mass_noise = 0.0f;
+    p.cord_xy_wander = 0.06f;
     p.m0 = 0.5f;
     p.m_ref = 1.0f;
     p.alpha_m = 1.0f;
+    p.alpha_e = 1.0f;
     p.mass_fp_fix = 1;
 
     p.wall_cooling = 2.0f;
@@ -750,6 +768,7 @@ SimParams default_sim_params() {
     p.sor_omega = 1.7f;
     p.inv_aspect_ratio = 0.0f;
     p.cent_C0 = 1.0f;
+    p.cent_bias_cterm = 1.0f;
 
     p.charge_mass_scale = 1.0f;
     p.charge_R0 = 0.01f;
@@ -764,7 +783,7 @@ SimParams default_sim_params() {
 
     p.heat_E_abs = 0.0f;
 
-    p.num_pair_maps = 32;
+    p.num_pair_maps = clamp_num_pair_maps(p.Nz);
 
     return p;
 }
@@ -790,7 +809,6 @@ SimParams load_sim_params(const std::string& path) {
     G("grid","wall_radius",wall_radius);
     G("grid","tube_length",tube_length);
     GI("grid","wall_z_periodic",wall_z_periodic);
-    GI("grid","num_pair_maps",num_pair_maps);
     G("grid","g_noise_init",g_noise_init);
     if (c["grid"]&&c["grid"]["heat_profile"]) {
         auto h = c["grid"]["heat_profile"];
@@ -837,10 +855,16 @@ SimParams load_sim_params(const std::string& path) {
 
     if (c["medium"]) {
         G("medium","cord_radius",cord_radius);
+        G("medium","cord_profile_frac",cord_profile_frac);
         G("medium","cord_mass",cord_mass);
+        G("medium","cord_cx",cord_cx);
+        G("medium","cord_cy",cord_cy);
+        G("medium","cord_mass_noise",cord_mass_noise);
+        G("medium","cord_xy_wander",cord_xy_wander);
         G("medium","m0",m0);
         G("medium","m_ref",m_ref);
         G("medium","alpha_m",alpha_m);
+        G("medium","alpha_e",alpha_e);
         GI("medium","mass_fp_fix",mass_fp_fix);
     }
 
@@ -868,6 +892,7 @@ SimParams load_sim_params(const std::string& path) {
         G("field","sor_omega",sor_omega);
         G("field","inv_aspect_ratio",inv_aspect_ratio);
         G("field","cent_C0",cent_C0);
+        G("field","cent_bias_cterm",cent_bias_cterm);
     }
     if (c["charge"]) {
         auto ch = c["charge"];
@@ -883,6 +908,8 @@ SimParams load_sim_params(const std::string& path) {
         G("beams","power",beam_power);
         G("beams","r0",beam_r0);
     }
+
+    p.num_pair_maps = clamp_num_pair_maps(p.Nz);
 
     #undef G
     #undef GI

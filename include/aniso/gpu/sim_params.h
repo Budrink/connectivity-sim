@@ -46,16 +46,16 @@ struct SimParams {
     float heat_rx, heat_ry, heat_rz;
     float heat_peak;
 
-    // --- S dynamics: S_nat = (E/E_ref)·I + κ·(∇E⊗∇E)/E_ref² ---
-    float grad_kappa;        // gradient anisotropy coupling strength
-    float grad_tau;          // legacy / unused: S = S_tgt every step (no τ relaxation)
-    float grad_E_ref;        // reference energy scale
+    // --- Edge transport scale: S_iso = grad_kappa*Ea*ma; Sab = S_iso*dist_fac*exp(-αm*Δm/Σm - αe*ΔE/ΣE); s_scaled=l0*(1+Sab) ---
+    float grad_kappa;        // κ in S_iso = κ * E * m (computed per pair in k_exchange)
+    float grad_tau;          // legacy / unused
+    float grad_E_ref;        // reference energy (metrics / legacy readback)
 
     // --- Wall ---
     float wall_radius;
     float tube_length;       // physical z-extent (Nz cells span this)
     int   wall_z_periodic;   // periodic boundary condition in z
-    int   num_pair_maps;     // Kawasaki pair-map pool (CPU-built); random slot per step
+    int   num_pair_maps;     // = Nz (clamped): Kawasaki pair-map pool; random slot per step
 
     // --- Initial conditions ---
     float g_noise_init;
@@ -68,11 +68,20 @@ struct SimParams {
     unsigned int step_count;
 
     // --- Plasma medium (mass field) ---
-    float cord_radius;       // initial cord radius (fraction of wall_radius)
-    float cord_mass;         // initial mass per cell inside cord
+    // cord_radius * wall_radius = outer R (hard support for random cord mass); init only
+    float cord_radius;
+    float cord_profile_frac; // unused (YAML compat; was Gaussian σ/R)
+    float cord_mass;         // peak m on axis (r=0)
+    // Mean axis in normalized grid coords [0,1] (same as heat_cx/cy); each z-slice shifts by cord_xy_wander
+    float cord_cx, cord_cy;
+    // Multiplicative noise: m *= max(0, 1 + cord_mass_noise * N(0,1)) per cell; 0 = off
+    float cord_mass_noise;
+    // Axis wander in xy vs z: smoothed N(0,1) along k, amplitude in normalized coords (~0.05 typical)
+    float cord_xy_wander;
     float m0;                // half-saturation for acceptance: alpha = m/(m+m0)
-    float m_ref;             // reference mass for tensor scaling
-    float alpha_m;           // mass power in S_nat: S *= (m/m_ref)^alpha_m
+    float m_ref;             // reference mass (legacy / metrics)
+    float alpha_m;           // α_m in exp(-α_m*|ma-mb|/(ma+mb) - …) on edge Sab
+    float alpha_e;           // α_e in exp(… - α_e*|Ea-Eb|/(Ea+Eb)) on edge Sab
     // 1: after Kawasaki exchange, rescale plasma m,q so Σm matches post-prepare (float drift).
     int   mass_fp_fix;
 
@@ -104,11 +113,12 @@ struct SimParams {
     int   poisson_iters;      // SOR iterations per field update
     int   field_update_every; // recompute B from j_acc every N steps (0 = never)
     float sor_omega;          // SOR over-relaxation factor (1.0–1.9)
-    float inv_aspect_ratio;   // ε: C_mid l→r; C_mid=C0(1+t·ε·C0), t=x along +x (inner at i=0)
-    float cent_C0;             // C0: inner C_mid; mass hop P∝p_base(1+Pc), Pc=C_mid·evx
+    float inv_aspect_ratio;   // ε: C_mid l→r in +x; also local_Bz taper (math_utils.cuh)
+    float cent_C0;             // C0: inner C_mid; Pcx=C_mid·ê_x on unit edge (x cent shift)
+    float cent_bias_cterm;     // unused (YAML compat); Cbias uses Pcx*mshift_avg in k_exchange
 
     // --- Charge field (3D): q ~ mass scale; MC hop → j_acc → J → ∇²A = -J → B = ∇×A + B_ext ---
-    float charge_mass_scale;  // q = scale * m at init
+    float charge_mass_scale;  // k_init only: q = m * scale; exchange uses q,m on nodes as-is (no rescale)
     float charge_R0;        // R = R0 / s_scaled; hop P uses s_scaled/R0; kernel floors R0 at 0.01 (no near-zero R)
     // Dimensionless; J from j_acc uses face areas in normalized xy (0..1) and tube_length in z:
     //   Jz  *= scale / (fe*dt*dx^2),   Jx,Jy *= scale / (fe*dt*dx*dz),  dx=1/(max(Nx,Ny)-1), dz=tube_length/Nz
