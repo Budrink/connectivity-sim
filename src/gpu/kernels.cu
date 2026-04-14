@@ -470,11 +470,12 @@ __global__ void k_prepare(GridFieldsPtrs f, SimParams p) {
 //  write races on wall_E[pk_idx] within k_exchange (plain adds, not atomics).
 //  s_scaled = l0*(1+Sab) per edge; Sab = κ*Ea*ma*dist_fac*exp(-αm*|ma-mb|/(ma+mb) - αe*|Ea-Eb|/(Ea+Eb))
 //  (wall partner: Eb, mb from wall_E / wall_edge_mass). dist_fac = 1/√(di²+dj²+dk²).
-//  Plasma-plasma (3D): one MC for full dM + dq_m; de = dM*Ea/ma; energy gates (0.5*Pv*dq_m, dq_m^2/R).
-//  P = exp(Pv*dq_m - dq_m^2/R + Ea-de-Eb) * s_scaled * dist * Pi_B * Cbias_m * Cbias_q * Pq.
-//  Accept: dm, dq, dEa = -de - deQ + 0.5*Pv*dq_m, dEb = +de + deQ + 0.5*Pv*dq_m, j_acc half dq_m.
+//  Plasma-plasma (3D): one MC for full dM + dm_q; de = dM*Ea/ma; energy gates (0.5*Pv*dm_q, dm_q^2/R).
+//  P = exp(Pv*dm_q - dm_q^2/R + Ea-de-Eb) * s_scaled * dist * Pi_B * Cbias_m * Cbias_q * Pq.
+//  Pi_B = exp(Bcross*(|J_b|^2-|J_a|^2)), a=gk donor, b=pk_idx partner.
+//  Accept: dm, dq, dEa = -de - deQ + 0.5*Pv*dm_q, dEb = +de + deQ + 0.5*Pv*dm_q, j_acc half dm_q.
 //  2D (Nz=1): mass-only exp(Ea-de-Eb)*s_scaled*Cbias_m; gates Ea>=de, Eb+de>=0.
-//  Cbias_mass = exp(Pcx*mshift_avg/dM); Cbias_q uses |dq_m| or 1 if dq_m=0.
+//  Cbias_mass = exp(Pcx*mshift_avg/dM); Cbias_q uses |dm_q| or 1 if dm_q=0.
 //  mass_shift EMA unchanged. Step3: energy only. Step4: plasma-wall charge sink only.
 //  Shift + XY rotation applied to map lookup each step.
 // ============================================================
@@ -490,8 +491,29 @@ __device__ inline float edge_s_scaled(
     float dE_rel = (Ea - Eb) / E_sum;
     float S_iso = p.grad_kappa * Ea * ma;
     float Sab = S_iso * dist_fac
-        * expf(p.alpha_m * dm_rel - p.alpha_e * dE_rel);
+        * expf(p.alpha_m * dm_rel + p.alpha_e * dE_rel);
     return l0 * (1.0f + Sab);
+}
+
+// Π_B = exp(Bcross * (|J_b|^2 - |J_a|^2)); a = donor cell, b = partner along ê.
+// Bcross = |B×ê|. If J not allocated, fall back to exp(-Bcross).
+__device__ inline float edge_pi_B(const GridFieldsPtrs& f, int idx_a, int idx_b,
+                                  float Bcross) {
+    float pi_arg;
+    if (f.Jx && f.Jy && f.Jz) {
+        float ax = f.Jx[idx_a];
+        float ay = f.Jy[idx_a];
+        float az = f.Jz[idx_a];
+        float bx = f.Jx[idx_b];
+        float by = f.Jy[idx_b];
+        float bz = f.Jz[idx_b];
+        float Ja2 = ax * ax + ay * ay + az * az;
+        float Jb2 = bx * bx + by * by + bz * bz;
+        pi_arg = Bcross * (Jb2 - Ja2);
+    } else {
+        pi_arg = -Bcross;
+    }
+    return expf(fminf(fmaxf(pi_arg, -60.0f), 60.0f));
 }
 
 __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
@@ -605,6 +627,8 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
     }
 
     float Bcross = 0.0f;
+    float gradB = 0.0f;
+
     if (p.Nz > 1) {
         float Bx = f.eq_bR[gk];
         float By = f.eq_bZ[gk];
@@ -613,6 +637,18 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
         float cy = Bz * evx - Bx * evz;
         float cz = Bx * evy - By * evx;
         Bcross = sqrtf(fmaxf(cx * cx + cy * cy + cz * cz, 0.f));
+
+        float ddx = (float)di * dx_xy_e;
+        float ddy = (float)dj * dx_xy_e;
+        float ddz = (float)dk * dz_z_e;
+        float edge_len =
+            sqrtf(fmaxf(ddx * ddx + ddy * ddy + ddz * ddz, 1e-24f));
+        float Ba = sqrtf(fmaxf(Bx * Bx + By * By + Bz * Bz, 0.f));
+        float Bbx = f.eq_bR[pk_idx];
+        float Bby = f.eq_bZ[pk_idx];
+        float Bbz = f.eq_bPhi[pk_idx];
+        float Bb = sqrtf(fmaxf(Bbx * Bbx + Bby * Bby + Bbz * Bbz, 0.f));
+        gradB = (Bb - Ba) / edge_len;
     }
 
     float C0s = fmaxf(p.cent_C0, 1e-6f);
@@ -630,7 +666,7 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
     float C_mid = fmaxf(C0s * (1.0f + tx_edge * (p.inv_aspect_ratio * C0s)), 1e-8f);
     float Pcx = C_mid * evx;
 
-    // --- Plasma–plasma: unified mass δM + charge dq_m (3D); mass-only (2D).
+    // --- Plasma–plasma: unified mass δM + charge dm_q (3D); mass-only (2D).
     if (!partner_wall && cur_ma + cur_mb > 1e-10f) {
         float m_don = cur_ma;
         float q_here = cur_qa;
@@ -647,35 +683,24 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
         if (deltaM > 1e-12f) {
             float Ea_mid = cur_Ea;
             float de = (deltaM > 1e-8f) ? deltaM * Ea_mid / cur_ma : 0.0f;
-            float dq_m = 0.f;
-            if (dm_q > 1e-20f && fabsf(q_here) > 1e-20f && mq_don > 1e-20f)
-                dq_m = q_here * (dm_q / mq_don);
 
             if (p.Nz > 1 && f.j_acc_x && f.j_acc_y && f.j_acc_z) {
                 float R0q = fmaxf(p.charge_R0, 0.01f);
                 float R_edge = R0q / fmaxf(s_scaled, 1e-20f);
                 float Pv = p.V_loop * evz;
-                float deQ = (dq_m * dq_m) / fmaxf(R_edge, 1e-20f);
-                float j_half = 0.5f * Pv * dq_m;
+                float deQ = (dm_q * dm_q) / fmaxf(R_edge, 1e-20f);
+                float j_half = 0.5f * Pv * dm_q;
                 float Ea_gate = cur_Ea - de + j_half - deQ;
                 float Eb_gate = cur_Eb + de + deQ + j_half;
                 if (Ea_gate >= 0.f && Eb_gate >= 0.f) {
-                    float Pi_B = expf(-Bcross);
-                    float pd_arg = Pv * dq_m - deQ + cur_Ea - de - cur_Eb;
-                    pd_arg = fminf(fmaxf(pd_arg, -60.0f), 60.0f);
+                    float Pi_B = expf((gradB-Bcross)*dm_q/deltaM);//edge_pi_B(f, gk, pk_idx, Bcross);
+                    // float pd_arg = Pv * dm_q - deQ + cur_Ea - de - cur_Eb;
+                    // pd_arg = fminf(fmaxf(pd_arg, -60.0f), 60.0f);
                     float Cbias_mass =
-                        expf(Pcx * m_shift_avg / fmaxf(deltaM, 1e-20f));
-                    float Cbias_ch = (fabsf(dq_m) < 1e-24f)
-                        ? 1.0f
-                        : expf(Pcx * m_shift_avg
-                               / fmaxf(fabsf(dq_m), 1e-20f));
-                    float qeps = 1e-8f;
-                    float Pq = (fabsf(dq_m) < 1e-24f)
-                        ? 1.0f
-                        : fabsf(qb_snap - qa_snap)
-                              / (fabsf(qa_snap) + fabsf(qb_snap) + qeps);
-                    float Pline = expf(pd_arg) * s_scaled * dist_fac * Cbias_mass
-                        * Cbias_ch * Pq * Pi_B;
+                        expf(Pcx * deltaM);
+                    float Pi_V = expf(Pv * dm_q/deltaM);
+                    float Pline = s_scaled  * Cbias_mass * Pi_V
+                         * Pi_B;
                     float p_eff = fminf(Pline, 1.0f);
                     float u_gate_u = gpu_rand_uniform(p.seed, edge_key, step, 90u);
                     bool acc = (Pline >= 1.0f) || (u_gate_u <= p_eff);
@@ -683,16 +708,16 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
                         mass_shift_current += fabsf(deltaM) * fabsf(evz);
                         dMa -= deltaM;
                         dMb += deltaM;
-                        dqa -= dq_m;
-                        dqb += dq_m;
+                        dqa -= dm_q;
+                        dqb += dm_q;
                         dEa += -de - deQ + j_half;
                         dEb += de + deQ + j_half;
-                        f.j_acc_x[gk] += -0.5f * dq_m * evx;
-                        f.j_acc_y[gk] += -0.5f * dq_m * evy;
-                        f.j_acc_z[gk] += -0.5f * dq_m * evz;
-                        f.j_acc_x[pk_idx] += 0.5f * dq_m * evx;
-                        f.j_acc_y[pk_idx] += 0.5f * dq_m * evy;
-                        f.j_acc_z[pk_idx] += 0.5f * dq_m * evz;
+                        f.j_acc_x[gk] += -0.5f * dm_q * evx;
+                        f.j_acc_y[gk] += -0.5f * dm_q * evy;
+                        f.j_acc_z[gk] += -0.5f * dm_q * evz;
+                        f.j_acc_x[pk_idx] += 0.5f * dm_q * evx;
+                        f.j_acc_y[pk_idx] += 0.5f * dm_q * evy;
+                        f.j_acc_z[pk_idx] += 0.5f * dm_q * evz;
                     }
                 }
             } else {
@@ -712,8 +737,8 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
                         dMb += deltaM;
                         if (dm_q > 1e-20f && fabsf(q_here) > 1e-20f
                             && mq_don > 1e-20f) {
-                            dqa -= dq_m;
-                            dqb += dq_m;
+                            dqa -= dm_q;
+                            dqb += dm_q;
                         }
                         dEa -= de;
                         dEb += de;
@@ -839,7 +864,7 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
 
             float delta = gpu_rand_uniform(p.seed, edge_key, step, 112u);
             float dq = delta * wqa;
-            float Pi_B_charge = expf(-Bcross);
+            float Pi_B_charge = edge_pi_B(f, gk, pk_idx, Bcross);
             float Cbias_charge =
                 expf(Pcx * m_shift_avg / fmaxf(dq, 1e-20f));
             float pd_arg = Pv * dq - (dq * dq) / fmaxf(R_edge, 1e-20f)

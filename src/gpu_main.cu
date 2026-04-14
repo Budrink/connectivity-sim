@@ -27,7 +27,7 @@ static ImU32 hot(float v) {
     float b = fminf(fmaxf((v-0.67f)*3.0f, 0.0f), 1.0f);
     return IM_COL32((int)(r*255),(int)(g*255),(int)(b*255),255);
 }
-// Mass viz: dark blue → teal → yellow-green (matches 3D TF); linear t in [0,1]
+// Mass viz: dark blue → teal → yellow-green (matches 3D TF); t in [0,1] (often from log10)
 static ImU32 mass_bluegreen(float v) {
     v = fminf(fmaxf(v, 0.0f), 1.0f);
     float r, g, b;
@@ -770,13 +770,22 @@ struct VolumeRenderer {
 // ============================================================
 //  2D Slice View (z-slice from 3D readback)
 // ============================================================
+// value_scale: 0 = linear in [lo,hi]; 1 = log10, mass in [lo,hi] (positive bounds).
 static void draw_heatmap_slice(const char* label, const float* data,
                                int Nx, int Ny, int Nz, int z_slice,
-                               ImU32 (*cmap)(float), float lo, float hi, float sz) {
+                               ImU32 (*cmap)(float), float lo, float hi, float sz,
+                               int value_scale = 0) {
     ImGui::BeginChild(label, ImVec2(sz+20, sz+52), true);
     ImGui::Text("%s  z=%d/%d", label, z_slice, Nz);
     ImVec4 cap_col(0.78f, 0.78f, 0.80f, 1.f);
-    ImGui::TextColored(cap_col, "colormap [%.3g, %.3g]", (double)lo, (double)hi);
+    if (value_scale == 1) {
+        float mn = fmaxf(lo, 1e-30f);
+        float mx = fmaxf(hi, mn * 1.0001f);
+        float llo = log10f(mn);
+        float lhi = log10f(mx);
+        ImGui::TextColored(cap_col, "colormap log10 [%.2f, %.2f]", llo, lhi);
+    } else
+        ImGui::TextColored(cap_col, "colormap [%.3g, %.3g]", (double)lo, (double)hi);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
 
     int step = 1;
@@ -786,13 +795,27 @@ static void draw_heatmap_slice(const char* label, const float* data,
     float cs = sz / fmaxf(mapW, mapH);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float range = fmaxf(hi - lo, 1e-8f);
+    float lmn = 0.f, lmx = 1.f;
+    if (value_scale == 1) {
+        float mn = fmaxf(lo, 1e-30f);
+        float mx = fmaxf(hi, mn * 1.0001f);
+        lmn = log10f(mn);
+        lmx = log10f(mx);
+        range = fmaxf(lmx - lmn, 1e-8f);
+    }
     int zk = std::max(0, std::min(z_slice, Nz - 1));
 
     for (int mi = 0; mi < mapW; ++mi)
     for (int mj = 0; mj < mapH; ++mj) {
         int si = mi*step, sj = mj*step;
         float raw = data[(si * Ny + sj) * Nz + zk];
-        float v = (raw - lo) / range;
+        float v;
+        if (value_scale == 1) {
+            float mn = fmaxf(lo, 1e-30f);
+            float lv = log10f(fmaxf(raw, mn));
+            v = (lv - lmn) / range;
+        } else
+            v = (raw - lo) / range;
         v = fminf(fmaxf(v, 0.f), 1.f);
         ImU32 col = cmap(v);
         float x0 = p0.x + mi*cs, y0 = p0.y + mj*cs;
@@ -981,8 +1004,10 @@ int main(int argc, char** argv) {
     std::vector<float> vol_em_;
     std::vector<float> vol_J_filtered_;
     std::vector<float> vol_charge_vis_;
+    std::vector<float> vol_mass_log_;
 
     bool  mass_viz_autoscale = true;
+    int   mass_autoscale_every = 10;
     float mass_col_hi = 1.0f;
     float mass_col_manual_max = 2.0f;
     const float controls_panel_w = 480.f;
@@ -1017,7 +1042,7 @@ int main(int argc, char** argv) {
                 E_scale = fmaxf(maxE / std::max(m.n_interior,1) * 3.0f, 0.5f);
             }
 
-            if (mass_viz_autoscale) {
+            if (mass_viz_autoscale && (frame_counter % mass_autoscale_every == 0)) {
                 const float* hm = grid.h_mass();
                 int nt = Nx * Ny * Nz;
                 float mx = 0.f;
@@ -1035,7 +1060,15 @@ int main(int argc, char** argv) {
             const float* vol_src = grid.h_E();
             int vol_tex_ch = 1;
             if (vol_data_mode == 1) {
-                vol_src = grid.h_mass();
+                int nt = Nx * Ny * Nz;
+                if ((int)vol_mass_log_.size() != nt)
+                    vol_mass_log_.resize((size_t)nt);
+                const float* hm = grid.h_mass();
+                float m_hi = fmaxf(mass_col_hi, 1e-20f);
+                float m_lo = fmaxf(m_hi * 1e-4f, 1e-20f);
+                for (int i = 0; i < nt; ++i)
+                    vol_mass_log_[i] = log10f(fmaxf(hm[i], m_lo));
+                vol_src = vol_mass_log_.data();
             } else if (vol_data_mode == 2) {
                 int nt = Nx * Ny * Nz;
                 if ((int)vol_em_.size() != nt)
@@ -1247,7 +1280,7 @@ int main(int argc, char** argv) {
                 ImGui::Separator(); ImGui::Text("Self-consistent B-field");
                 ImGui::SliderInt("field update N", &pp.field_update_every, 0, 100);
                 if (pp.field_update_every > 0) {
-                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, 0.0f, 1000.0f, "%.3f");
+                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, 0.0f, 10.0f, "%.3f");
                     ImGui::SliderFloat("Bz_ext", &pp.Bz_ext, 0.0f, 50.0f, "%.2f");
                     ImGui::SliderFloat("charge_mass_scale", &pp.charge_mass_scale, 0.0f, 5.0f, "%.2f");
                     ImGui::SliderFloat("charge R0", &pp.charge_R0, 0.01f, 50.0f, "%.2f");
@@ -1335,8 +1368,9 @@ int main(int argc, char** argv) {
             }
 
             ImGui::Separator();
-            ImGui::Text("Mass (2D + vol): blue-green, linear [0, m_max]");
+            ImGui::Text("Mass (2D + vol): blue-green, log10(m), ~4 decades below m_max");
             ImGui::Checkbox("Mass autoscale", &mass_viz_autoscale);
+            ImGui::SliderInt("Mass autoscale every (frames)", &mass_autoscale_every, 1, 60);
             if (!mass_viz_autoscale)
                 ImGui::SliderFloat("Mass m_max (color scale)", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
 
@@ -1396,11 +1430,13 @@ int main(int argc, char** argv) {
                 ImGui::EndGroup();
             } else {
                 const float* mdata = grid.h_mass();
+                float m_hi_map = fmaxf(mass_col_hi, 1e-20f);
+                float m_lo_map = fmaxf(m_hi_map * 1e-4f, 1e-20f);
                 ImGui::BeginGroup();
                 draw_heatmap_slice("Energy (E)", edata, Nx, Ny, Nz, z_slice, hot, 0, E_scale, map_size);
                 ImGui::SameLine(0.f, 8.f);
-                draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, mass_bluegreen, 0.f,
-                                   mass_col_hi, map_size);
+                draw_heatmap_slice("Mass", mdata, Nx, Ny, Nz, z_slice, mass_bluegreen,
+                                   m_lo_map, m_hi_map, map_size, 1);
                 ImGui::SameLine(0.f, 8.f);
                 draw_heatmap_slice("|grad E|^2", gEdata, Nx, Ny, Nz, z_slice, hot, 0, gradE_scale, map_size);
                 ImGui::SameLine(0.f, 8.f);
@@ -1419,8 +1455,10 @@ int main(int argc, char** argv) {
                 float vol_hi = vol_use_map_E_scale ? E_scale : vol_E_max;
                 float vol_lo = 0.0f;
                 if (vol_data_mode == 1) {
-                    vol_lo = 0.0f;
-                    vol_hi = fmaxf(mass_col_hi, 1e-10f);
+                    float m_hi = fmaxf(mass_col_hi, 1e-20f);
+                    float m_lo = fmaxf(m_hi * 1e-4f, 1e-20f);
+                    vol_lo = log10f(m_lo);
+                    vol_hi = log10f(m_hi);
                 } else if (vol_data_mode == 2)
                     vol_hi = fmaxf(vol_em_max, 0.1f);
                 else if (vol_data_mode == 3)

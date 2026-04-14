@@ -762,18 +762,18 @@ SimParams default_sim_params() {
 
     p.V_loop = 0.0f;
     p.spitzer_exp = 1.5f;
-    p.Bz_ext = 5.0f;
+    p.Bz_ext = 2.0f;
     p.poisson_iters = 64;
-    p.field_update_every = 1;
+    p.field_update_every = 8;
     p.sor_omega = 1.7f;
-    p.inv_aspect_ratio = 0.0f;
+    p.inv_aspect_ratio = 0.1f;
     p.cent_C0 = 1.0f;
     p.cent_bias_cterm = 1.0f;
 
     p.charge_mass_scale = 1.0f;
     p.charge_R0 = 0.01f;
     // ~1 after geometry: j_acc is O(q); denom fe*dt*dx^2 is O(1e-6) on 128^2 grid → start near 1e-3
-    p.charge_j_scale = 1e-3f;
+    p.charge_j_scale = 1.0f;
 
     p.n_beams = 0;
     p.beam_sigma_r = 0.03f;
