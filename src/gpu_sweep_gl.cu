@@ -27,8 +27,9 @@ int main(int argc, char* argv[]) {
     base.Nx = grid_N; base.Ny = grid_N;
     base.dt = 0.005f;
 
-    base.gamma_rad = 0.001f;
-    base.rad_exp = 1.5f;
+    base.cord_radius = 0.8f;
+    base.cord_mass = 1.0f;
+    base.m0 = 0.5f;
 
     base.grad_tau = 0.3f;
     base.grad_E_ref = 1.0f;
@@ -93,6 +94,7 @@ int main(int argc, char* argv[]) {
         }
 
         grid.init(p);
+        grid.wait_pair_maps();
         grid.step_n(warmup);
 
         double sum_cE=0, sum_eE=0, sum_conf=0, sum_wf=0;

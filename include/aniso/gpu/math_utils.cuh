@@ -3,11 +3,20 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-// Toroidal field with 1/R variation: Bz(x) = Bz_ext / (1 + ε·(2x/(Nx-1) - 1))
+// Axial field profile, linear left→right in normalized x (xn∈[-1,1]): B = Bext·(1 − ε·(xn+1)/2)
 __device__ __forceinline__
 float local_Bz(float Bz_ext, float inv_aspect, int i, int Nx) {
     float xn = (Nx > 1) ? 2.0f * (float)i / (float)(Nx - 1) - 1.0f : 0.0f;
-    return Bz_ext / fmaxf(1.0f + inv_aspect * xn, 0.1f);
+    float t = 0.5f * (xn + 1.0f);
+    return Bz_ext * fmaxf(1.0f - inv_aspect * t, 0.05f);
+}
+
+// Ionization fraction: tanh(k·E/(2M)) = 2/(1+exp(−k·E/M)) − 1; charge Q = f·M
+__device__ __forceinline__
+float ionization_f(float E, float M, float k) {
+    if (M <= 1e-30f || k <= 0.0f) return 0.0f;
+    float em = expf(-k * E / M);
+    return fmaxf(2.0f / (1.0f + em) - 1.0f, 0.0f);
 }
 
 // ============================================================
@@ -224,19 +233,21 @@ float anisotropy3x3(float s00, float s01, float s02,
     return e.l3 / lmin - 1.0f;
 }
 
-// Full 3D suppress-only congruence: M = β·I + γ·b⊗b, β=1/√(1+fk), γ=1-β.
-// b = (bx, by, bz) must be a unit vector. T' = M·T·M.
-// Preserves transport along B, suppresses perpendicular by β².
+// 3D field-aligned congruence: M = λ⊥·I + (λ∥−λ⊥)·b⊗b, T' = M·T·M.
+// b = (bx, by, bz) must be a unit vector.
+// λ∥ = √(1+fk), λ⊥ = 1/√(1+fk)  →  stretches along B, suppresses ⊥ (λ∥/λ⊥ = 1+fk).
+// fk = 0  →  M = I.
 __device__ __forceinline__
 void apply_field_congruence(float& T00, float& T01, float& T02,
                             float& T11, float& T12, float& T22,
                             float bx, float by, float bz, float fk) {
-    float beta  = rsqrtf(1.0f + fk);
-    float gamma = 1.0f - beta;
+    float lam_perp = rsqrtf(1.0f + fk);
+    float lam_par  = sqrtf(1.0f + fk);
+    float dlam = lam_par - lam_perp;
 
-    float m00 = beta + gamma*bx*bx, m01 = gamma*bx*by, m02 = gamma*bx*bz;
-    float m11 = beta + gamma*by*by, m12 = gamma*by*bz;
-    float m22 = beta + gamma*bz*bz;
+    float m00 = lam_perp + dlam*bx*bx, m01 = dlam*bx*by, m02 = dlam*bx*bz;
+    float m11 = lam_perp + dlam*by*by, m12 = dlam*by*bz;
+    float m22 = lam_perp + dlam*bz*bz;
 
     // R = M · T  (M is symmetric so M = M^T)
     float r00 = m00*T00 + m01*T01 + m02*T02;

@@ -1,10 +1,10 @@
 # 3D tube with self-consistent B-field
-# 128x128 cross-section, 256 axial layers, periodic z
+# 64x64x128, periodic z (toroidal)
 
 grid:
-  Nx: 128
-  Ny: 128
-  Nz: 32
+  Nx: 64
+  Ny: 64
+  Nz: 128
   wall_radius: 0.45
   tube_length: 1.0
   wall_z_periodic: 1
@@ -13,8 +13,8 @@ grid:
     cx: 0.5
     cy: 0.5
     cz: 0.5
-    rx: 0.2
-    ry: 0.2
+    rx: 0.1
+    ry: 0.1
     rz: 0.05
     peak: 1.0
 
@@ -30,23 +30,32 @@ resolution:
   alpha: 1.0
 
 heater:
-  type: target
+  type: constant
   power: 5.0
-  E_target: 2.0
-  k_heat: 2.0
 
 g_response:
   grad_kappa: 5.0
   grad_tau: 0.3
   grad_E_ref: 1.0
 
-radiation:
-  gamma_rad: 0.001
-  rad_exp: 1.5
+medium:
+  cord_radius: 0.2
+  cord_profile_frac: 0.42  # unused (kept for YAML compat)
+  cord_mass: 1.0            # target mean mass per cell inside r<R; actual Σm = cord_mass * N_support
+  cord_cx: 0.5      # cylinder axis x in normalized grid coords (0..1), like heater cx
+  cord_cy: 0.5
+  cord_mass_noise: 0.12   # multiplicative on Gaussian m per cell
+  cord_xy_wander: 0.07    # axis xy offset vs z (normalized); smoothed along k
+  m0: 0.5
+  m_ref: 1.0
+  alpha_m: 1.0
 
 wall:
   cooling: 2.0
   E_max: 100.0
+  sink_E_gain: 50.0   # ohmic heating multiplier when current/plasma hits wall (exchange path)
+  edge_mass: 20.0     # effective wall mass on plasma–wall energy Metropolis (Ps_en + w_light/w_heavy)
+  rad_alpha: 0.0      # dE/dt = rad_alpha * m * E^2 → uniform wall heating; 0 = off
 
 equilibrium:
   chi_parallel: 1.0
@@ -54,14 +63,20 @@ equilibrium:
 
 field:
   V_loop: 0.01
-  spitzer_exp: 1.5
+  spitzer_exp: 1.5   # legacy key, ignored
   Bz_ext: 2.0
-  poisson_iters: 500
-  update_every: 2
+  poisson_iters: 64
+  update_every: 1
   sor_omega: 1.7
-  kappa: 10.0
-  beta_scale: 10.0
   inv_aspect_ratio: 0.1
+  cent_C0: 1.0
+  cent_bias_cterm: 1.0
+
+charge:
+  ionization_k: 1.0
+  mass_scale: 1.0
+  R0: 0.01
+  j_scale: 1.0
 
 beams:
   n_beams: 0

@@ -3,6 +3,8 @@
 #include "sim_params.h"
 #include "kernels.cuh"
 #include <cuda_runtime.h>
+#include <atomic>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -13,14 +15,33 @@ class GpuGrid {
     SimParams       params_{};
     GlobalMetrics   host_metrics_{};
     GlobalMetrics*  d_metrics_ = nullptr;
+    float           host_wall_q_sink_last_frame_ = 0.f;
+    double*         d_mass_sum_ = nullptr;   // temp for Σm_buf (plasma)
+    double*         d_mass_ref_ = nullptr;   // Σm_buf after prepare (reference for FP fix)
+    unsigned int*   d_mass_support_cnt_ = nullptr; // cord init: cells inside r<R (for Σm target)
 
     int total_ = 0;
     bool initialized_ = false;
     cudaStream_t stream_ = 0;
 
-    std::vector<float> h_E_, h_aniso_, h_aniso_angle_;
+    std::vector<float> h_E_, h_mass_, h_aniso_, h_aniso_angle_;
     std::vector<float> h_wall_flux_, h_wall_E_, h_gradE_sq_;
     std::vector<float> h_psi_norm_;
+    std::vector<float> h_J_mag_;
+    std::vector<float> h_B_mag_;
+    std::vector<float> h_J_vis_;   // 3 * N cells (RGB packed J dir + |J|)
+    std::vector<float> h_q_;
+
+    // Kawasaki pair map (CPU build may run async; upload on main thread after join)
+    std::vector<unsigned char> h_pair_map_;
+    std::future<std::vector<unsigned char>> pair_map_future_;
+    bool pair_maps_gpu_ready_ = false;
+    std::atomic<int> pair_map_build_done_{0};
+    std::atomic<int> pair_map_build_total_{0};
+
+    void upload_pair_map();
+    void discard_pending_pair_map_build();
+    void start_pair_map_build_async();
 
     bool eq_loaded_ = false;
     struct EqData {
@@ -43,7 +64,21 @@ public:
 
     bool load_equilibrium(const std::string& bin_path);
     void init(const SimParams& p);
-    void reset();
+    /// Resets fields and time; by default keeps Kawasaki pair maps (built once in init).
+    void reset(bool rebuild_pair_maps = false);
+    /// Non-blocking: if CPU build finished, upload to GPU and return true.
+    bool poll_pair_maps();
+    /// Block until pair maps are on GPU (use after init in non-GUI code).
+    void wait_pair_maps();
+    bool pair_maps_ready() const { return pair_maps_gpu_ready_; }
+    /// 0..1 while CPU build runs; 1 when maps are on GPU.
+    float pair_map_build_progress() const;
+    int pair_map_build_done_count() const {
+        return pair_map_build_done_.load(std::memory_order_relaxed);
+    }
+    int pair_map_build_total_count() const {
+        return pair_map_build_total_.load(std::memory_order_relaxed);
+    }
     void step();
     void step_n(int n);
     void readback();
@@ -61,12 +96,17 @@ public:
     float t() const { return params_.t; }
 
     const float* h_E()           const { return h_E_.data(); }
+    const float* h_mass()        const { return h_mass_.data(); }
     const float* h_aniso()       const { return h_aniso_.data(); }
     const float* h_aniso_angle() const { return h_aniso_angle_.data(); }
     const float* h_wall_flux()   const { return h_wall_flux_.data(); }
     const float* h_wall_E()      const { return h_wall_E_.data(); }
     const float* h_gradE_sq()    const { return h_gradE_sq_.data(); }
     const float* h_psi_norm()    const { return h_psi_norm_.data(); }
+    const float* h_J_mag()       const { return h_J_mag_.data(); }
+    const float* h_B_mag()       const { return h_B_mag_.data(); }
+    const float* h_J_vis()       const { return h_J_vis_.data(); }
+    const float* h_q()          const { return h_q_.data(); }
     bool has_equilibrium()       const { return eq_loaded_; }
 
     const GlobalMetrics& metrics() const { return host_metrics_; }
