@@ -155,4 +155,16 @@ target_compile_options(aniso_sweep_3d PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -O3>
 )
 
-message(STATUS "GPU targets: aniso_gpu_core, aniso_gpu, aniso_sweep_gl, aniso_sweep_3d")
+# --- Heating-width sweep (cold-edge disruption demo) ---
+add_executable(aniso_sweep_heating src/gpu_sweep_heating.cu)
+target_include_directories(aniso_sweep_heating PRIVATE include)
+target_link_libraries(aniso_sweep_heating PRIVATE aniso_gpu_core CUDA::cudart)
+set_target_properties(aniso_sweep_heating PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "89"
+)
+target_compile_options(aniso_sweep_heating PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -O3>
+)
+
+message(STATUS "GPU targets: aniso_gpu_core, aniso_gpu, aniso_sweep_gl, aniso_sweep_3d, aniso_sweep_heating")

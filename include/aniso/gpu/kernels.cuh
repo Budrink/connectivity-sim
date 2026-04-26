@@ -27,6 +27,7 @@ struct GridFieldsPtrs {
 
     // Static fields
     float *heat_profile;
+    float *V_profile;       // per-cell loop voltage (Gaussian, may dip below zero)
     unsigned char *is_wall;
 
     // Per-cell wall flux (energy lost to wall neighbors this step)
@@ -42,9 +43,8 @@ struct GridFieldsPtrs {
     float *eq_bZ;        // B_Z component of unit b-vector
     float *eq_bPhi;      // toroidal (axial z) component of unit b-vector
 
-    // Self-consistent field (3D): J from charge accumulators, A from ∇²A = -J
+    // Current (3D): J = snapshot of j_acc (EMA-smoothed charge flux).
     float *Jx, *Jy, *Jz;
-    float *Ax, *Ay, *Az;
     float *j_acc_x, *j_acc_y, *j_acc_z;
 
     // Beam heating array: [n_beams * 3] = {x, y, z} per beam (normalized 0–1)
@@ -98,6 +98,12 @@ struct GlobalMetrics {
     // Σ|Δq| plasma→wall this sim step (atomic accum); host-patched in GpuGrid::sync
     float wall_q_sink_step;
 
+    // Diagnostics: max of self-poloidal B = sqrt(Bx^2+By^2), max of |Jz|,
+    // and max of |(J×B)·r̂| (projected onto radial direction) — to check Lorentz drive magnitude.
+    float max_Bpol;
+    float max_Jz_abs;
+    float max_JxB_r;
+
     // Region counts
     int   n_interior;
     int   n_center;
@@ -128,9 +134,7 @@ void launch_readback(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 void launch_compute_metrics(GridFieldsPtrs& f, const SimParams& p,
                             GlobalMetrics* d_out, cudaStream_t s = 0);
 
-// Self-consistent B-field: j_acc → J → Poisson on Ax,Ay,Az → B = curl A + B_ext
+// j_acc (EMA of charge flux) → J snapshot. Pi_B uses Bcross(B_ext) + k·F·ê/(dm_q²).
+void launch_decay_j_accum(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 void launch_fill_J_from_charge_accum(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
 void launch_clear_j_accum(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);
-void launch_poisson_sor(GridFieldsPtrs& f, const SimParams& p, int color,
-                        const float* Jsrc, float* Adst, cudaStream_t s = 0);
-void launch_update_bfield(GridFieldsPtrs& f, const SimParams& p, cudaStream_t s = 0);

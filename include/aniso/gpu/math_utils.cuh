@@ -11,6 +11,14 @@ float local_Bz(float Bz_ext, float inv_aspect, int i, int Nx) {
     return Bz_ext * fmaxf(1.0f - inv_aspect * t, 0.05f);
 }
 
+// Ionization fraction: tanh(k·E/(2M)) = 2/(1+exp(−k·E/M)) − 1; charge Q = f·M
+__device__ __forceinline__
+float ionization_f(float E, float M, float k) {
+    if (M <= 1e-30f || k <= 0.0f) return 0.0f;
+    float em = expf(-k * E / M);
+    return fmaxf(2.0f / (1.0f + em) - 1.0f, 0.0f);
+}
+
 // ============================================================
 //  2x2 symmetric matrix operations (kept for Nz==1 compat)
 // ============================================================

@@ -106,23 +106,53 @@ struct SimParams {
     float chi_parallel;
     float chi_perp;
 
-    // --- Self-consistent B-field (charge transport + vector Poisson) ---
-    float V_loop;             // loop voltage: Pv = V_loop * (ê·ẑ) on exchange edge (unit dir in x,y,z phys)
-    float spitzer_exp;        // legacy YAML; unused (kept for config compatibility)
-    float Bz_ext;             // external axial (toroidal) field magnitude
-    int   poisson_iters;      // SOR iterations per field update
-    int   field_update_every; // recompute B from j_acc every N steps (0 = never)
-    float sor_omega;          // SOR over-relaxation factor (1.0–1.9)
-    float inv_aspect_ratio;   // ε: C_mid l→r in +x; also local_Bz taper (math_utils.cuh)
-    float cent_C0;             // C0: inner C_mid; Pcx=C_mid·ê_x on unit edge (x cent shift)
-    float cent_bias_cterm;     // unused (YAML compat); Cbias uses Pcx*mshift_avg in k_exchange
+    // --- Loop-voltage drive (signed Gaussian profile in xy) ---
+    //   V(x,y) = V_loop_offset + V_loop_amp · exp(-½·((x-cx)²/rx² + (y-cy)²/ry²))
+    // On each edge Pv = V_local · (ê·ẑ), V_local = ½(V_profile[a] + V_profile[b]).
+    // Sign matters: V>0 → forward drive and ohmic heating j_half = ½·Pv·dm_q;
+    //                V<0 → counter-drive, j_half<0 (physical counter-EMF cooling).
+    // V_loop_offset may be negative → Gaussian tails dip below zero, producing
+    // a radially signed V profile (source of ExB shear at the zero crossing).
+    float V_loop_amp;           // peak amplitude at the centre (may be <0 to invert)
+    float V_loop_offset;        // baseline (may be <0 → counter-driven outer ring)
+    float V_loop_cx, V_loop_cy; // centre in normalized [0,1] grid coords
+    float V_loop_rx, V_loop_ry; // Gaussian widths in normalized [0,1]
 
-    // --- Charge field (3D): q ~ mass scale; MC hop → j_acc → J → ∇²A = -J → B = ∇×A + B_ext ---
-    float charge_mass_scale;  // k_init only: q = m * scale; exchange uses q,m on nodes as-is (no rescale)
-    float charge_R0;        // R = R0 / s_scaled; hop P uses s_scaled/R0; kernel floors R0 at 0.01 (no near-zero R)
-    // Dimensionless; J from j_acc uses face areas in normalized xy (0..1) and tube_length in z:
-    //   Jz  *= scale / (fe*dt*dx^2),   Jx,Jy *= scale / (fe*dt*dx*dz),  dx=1/(max(Nx,Ny)-1), dz=tube_length/Nz
-    float charge_j_scale;
+    // --- Magnetic field & current snapshot ---
+    float spitzer_exp;          // legacy YAML key; unused (kept for config compatibility)
+    float Bz_ext;               // external axial (toroidal) field magnitude — the only B
+                                // field in the model; self-consistent Poisson B is removed,
+                                // currents interact locally via the Ampere term in Pi_B.
+    int   field_update_every;   // snapshot j_acc → J every N steps (0 = never).
+                                // Pi_B reads Jx/Jy/Jz inside edge_pi_B_mid.
+    int   j_smooth_window;      // EMA window (steps) for j_acc: decay = 1 − 1/W, hop·(1/W).
+                                // Decoupled from field_update_every so we can suppress
+                                // thermal noise with a wide window without rebuilding J
+                                // too often.
+    float inv_aspect_ratio;     // ε: C_mid grows linearly in +x; also tapers local_Bz.
+    float cent_C0;              // inner C_mid; Pcx = C_mid·ê_x on the unit edge.
+    float cent_bias_cterm;      // unused (YAML compat); Cbias uses Pcx·mshift_avg in k_exchange.
+
+    // --- Charge transport (3D) ---
+    // Each step  j_acc ← j_acc·(1−n) + hop·n,  n = 1/W;  J = snapshot of j_acc.
+    //
+    // Pi_B (magnetic contribution to pi_arg, applied per Kawasaki edge):
+    //     Pi_B = ( −|B_ext×ê|  +  k·F·ê / (dm_q² + ε) ) · f_a,
+    //     k = charge_j_scale,  f_a = dm_q/δM.
+    //
+    // Term 1: Larmor suppression of transverse hops in B_ext.
+    // Term 2: Ampere force between two neighbouring current elements (double cross
+    //   product, BAC−CAB identity, with the Biot–Savart convention r̂ = b→a = −ê):
+    //     F·ê = [ (J_a·J_b) − (J_a·ê)(J_b·ê) ] / |r|².
+    //   Parallel currents on a transverse edge → F·ê > 0  (currents attract).
+    //   The 1/dm_q² rescaling cancels the bilinear-in-J factor (locally J ~ C·dm_q)
+    //   so the term enters pi_arg with the same "per-dm_q" weight as Larmor.
+    //   Global ⟨|J|²⟩ rescalings were tried and broke pinch directionality; the
+    //   local form is preserved. See edge_pi_B_mid in kernels.cu.
+    float ionization_k;         // Q = f(E,M)·M with f = tanh(k·E/(2M)); see ionization_f.
+    float charge_mass_scale;    // legacy; cord init now uses ionization_f(E,m,k)·m directly.
+    float charge_R0;            // R_edge = R0 / s_scaled; kernel floors R0 at 0.01.
+    float charge_j_scale;       // k in the local Ampere term; calibration constant.
 
     // --- Beam array heating (used when heater_type == HEAT_BEAM_ARRAY) ---
     int   n_beams;            // number of heating beams

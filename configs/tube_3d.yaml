@@ -73,9 +73,10 @@ field:
   cent_bias_cterm: 1.0
 
 charge:
+  ionization_k: 1.0
   mass_scale: 1.0
   R0: 0.01
-  j_scale: 0.001
+  j_scale: 1.0
 
 beams:
   n_beams: 0

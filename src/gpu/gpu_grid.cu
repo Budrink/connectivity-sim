@@ -126,6 +126,7 @@ void GpuGrid::alloc_all() {
     af(&fields_.s00_obs); af(&fields_.s01_obs); af(&fields_.s02_obs);
     af(&fields_.s11_obs); af(&fields_.s12_obs); af(&fields_.s22_obs);
     af(&fields_.heat_profile);
+    af(&fields_.V_profile);
     au(&fields_.is_wall);
     af(&fields_.wall_flux);
     af(&fields_.wall_E);
@@ -135,7 +136,6 @@ void GpuGrid::alloc_all() {
     af(&fields_.q); af(&fields_.q_buf);
     af(&fields_.j_acc_x); af(&fields_.j_acc_y); af(&fields_.j_acc_z);
     af(&fields_.Jx); af(&fields_.Jy); af(&fields_.Jz);
-    af(&fields_.Ax); af(&fields_.Ay); af(&fields_.Az);
 
     fields_.beam_data = nullptr;
     if (params_.n_beams > 0) {
@@ -188,6 +188,7 @@ void GpuGrid::free_all() {
     ff(fields_.s00_obs); ff(fields_.s01_obs); ff(fields_.s02_obs);
     ff(fields_.s11_obs); ff(fields_.s12_obs); ff(fields_.s22_obs);
     ff(fields_.heat_profile);
+    ff(fields_.V_profile);
     fu(fields_.is_wall);
     ff(fields_.wall_flux);
     ff(fields_.wall_E);
@@ -197,7 +198,6 @@ void GpuGrid::free_all() {
     ff(fields_.q); ff(fields_.q_buf);
     ff(fields_.j_acc_x); ff(fields_.j_acc_y); ff(fields_.j_acc_z);
     ff(fields_.Jx); ff(fields_.Jy); ff(fields_.Jz);
-    ff(fields_.Ax); ff(fields_.Ay); ff(fields_.Az);
     ff(fields_.beam_data);
     fu(fields_.pair_map);
     ff(fields_.wall_q_sink_accum);
@@ -468,8 +468,8 @@ void GpuGrid::init(const SimParams& p) {
 
     fprintf(stderr, "Init %dx%dx%d  dt=%.5f  eig_lo=%.2f  eig_hi=%.0f (safety cap)\n",
             params_.Nx, params_.Ny, params_.Nz, params_.dt, params_.eig_lo, params_.eig_hi);
-    fprintf(stderr, "  V_loop=%.3f  Bz=%.1f  E_ref=%.1f  grad_kappa=%.1f  eps=%.3f\n",
-            params_.V_loop, params_.Bz_ext,
+    fprintf(stderr, "  V_amp=%.3f V_off=%.3f  Bz=%.1f  E_ref=%.1f  grad_kappa=%.1f  eps=%.3f\n",
+            params_.V_loop_amp, params_.V_loop_offset, params_.Bz_ext,
             params_.grad_E_ref, params_.grad_kappa, params_.inv_aspect_ratio);
 
     if (!stream_) CK(cudaStreamCreate(&stream_));
@@ -486,9 +486,6 @@ void GpuGrid::init(const SimParams& p) {
     CK(cudaMemset(fields_.Jx, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.Jy, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.Jz, 0, total_ * sizeof(float)));
-    CK(cudaMemset(fields_.Ax, 0, total_ * sizeof(float)));
-    CK(cudaMemset(fields_.Ay, 0, total_ * sizeof(float)));
-    CK(cudaMemset(fields_.Az, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.eq_bR, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.eq_bZ, 0, total_ * sizeof(float)));
     CK(cudaMemset(fields_.eq_bPhi, 0, total_ * sizeof(float)));
@@ -527,8 +524,6 @@ void GpuGrid::init(const SimParams& p) {
         upload_equilibrium();
     launch_init_fields(fields_, params_, stream_);
     launch_init_cord_mass_random(fields_, params_, d_mass_sum_, d_mass_support_cnt_, stream_);
-    if (params_.Nz > 1 && params_.field_update_every > 0)
-        launch_update_bfield(fields_, params_, stream_);
     CK(cudaStreamSynchronize(stream_));
 
     {
@@ -552,8 +547,6 @@ void GpuGrid::reset(bool rebuild_pair_maps) {
         std::chrono::high_resolution_clock::now().time_since_epoch().count();
     launch_init_fields(fields_, params_, stream_);
     launch_init_cord_mass_random(fields_, params_, d_mass_sum_, d_mass_support_cnt_, stream_);
-    if (params_.Nz > 1 && params_.field_update_every > 0)
-        launch_update_bfield(fields_, params_, stream_);
     CK(cudaStreamSynchronize(stream_));
     if (rebuild_pair_maps)
         start_pair_map_build_async();
@@ -597,6 +590,8 @@ void GpuGrid::step() {
         std::uniform_int_distribution<int> dsz(0, params_.Nz - 1);
         shift_z = dsz(map_rng);
     }
+    if (params_.Nz > 1 && params_.field_update_every > 0)
+        launch_decay_j_accum(fields_, params_, stream_);
     launch_exchange(fields_, params_, shift_z, map_slot, nm, stream_);
 
     if (params_.mass_fp_fix)
@@ -605,21 +600,15 @@ void GpuGrid::step() {
     if (params_.mass_fp_fix)
         launch_apply_mass_fp_fix(fields_, params_, d_mass_ref_, d_mass_sum_, stream_);
 
-    // After this step's exchange, j_acc includes transport for step (step_count+1); Poisson every field_update_every.
+    // j_acc: EMA per step (decay + hop·n). Pi_B reads J = j_acc directly from
+    // Jx/Jy/Jz inside edge_pi_B_mid; fill_J runs every field_update_every steps
+    // just to refresh those three arrays (and the host visualization). With no
+    // Poisson / update_bfield, B is purely external (B_ext) while currents
+    // interact locally via the Ampere term k·(J_a·J_b).
     const int sc_next = params_.step_count + 1;
     if (params_.Nz > 1 && params_.field_update_every > 0 && sc_next > 0 &&
         sc_next % params_.field_update_every == 0) {
         launch_fill_J_from_charge_accum(fields_, params_, stream_);
-        for (int it = 0; it < params_.poisson_iters; it++) {
-            launch_poisson_sor(fields_, params_, 0, fields_.Jx, fields_.Ax, stream_);
-            launch_poisson_sor(fields_, params_, 1, fields_.Jx, fields_.Ax, stream_);
-            launch_poisson_sor(fields_, params_, 0, fields_.Jy, fields_.Ay, stream_);
-            launch_poisson_sor(fields_, params_, 1, fields_.Jy, fields_.Ay, stream_);
-            launch_poisson_sor(fields_, params_, 0, fields_.Jz, fields_.Az, stream_);
-            launch_poisson_sor(fields_, params_, 1, fields_.Jz, fields_.Az, stream_);
-        }
-        launch_update_bfield(fields_, params_, stream_);
-        launch_clear_j_accum(fields_, params_, stream_);
     }
 
     launch_tensor_step(fields_, params_, stream_);
@@ -760,19 +749,22 @@ SimParams default_sim_params() {
     p.chi_parallel = 100.0f;
     p.chi_perp = 1.0f;
 
-    p.V_loop = 0.0f;
+    p.V_loop_amp    = 0.0f;
+    p.V_loop_offset = 0.0f;
+    p.V_loop_cx = 0.5f; p.V_loop_cy = 0.5f;
+    p.V_loop_rx = 0.2f; p.V_loop_ry = 0.2f;
     p.spitzer_exp = 1.5f;
     p.Bz_ext = 2.0f;
-    p.poisson_iters = 64;
     p.field_update_every = 8;
-    p.sor_omega = 1.7f;
+    p.j_smooth_window = 64;
     p.inv_aspect_ratio = 0.1f;
     p.cent_C0 = 1.0f;
     p.cent_bias_cterm = 1.0f;
 
+    p.ionization_k = 1.0f;
     p.charge_mass_scale = 1.0f;
     p.charge_R0 = 0.01f;
-    // ~1 after geometry: j_acc is O(q); denom fe*dt*dx^2 is O(1e-6) on 128^2 grid → start near 1e-3
+    // ~1 after geometry: j_acc is O(q); denom dt*dx^2 is O(1e-6) on 128^2 grid → start near 1e-3
     p.charge_j_scale = 1.0f;
 
     p.n_beams = 0;
@@ -884,18 +876,31 @@ SimParams load_sim_params(const std::string& path) {
     }
 
     if (c["field"]) {
-        G("field","V_loop",V_loop);
+        // Legacy compatibility: a scalar V_loop in the YAML maps to V_loop_amp
+        // with wide Gaussian radii (effectively uniform V across the cord). New
+        // V_loop_* keys below override this fallback.
+        if (c["field"]["V_loop"]) {
+            p.V_loop_amp = c["field"]["V_loop"].as<float>();
+            p.V_loop_offset = 0.0f;
+            p.V_loop_rx = 10.0f; p.V_loop_ry = 10.0f;
+        }
+        G("field","V_loop_amp",V_loop_amp);
+        G("field","V_loop_offset",V_loop_offset);
+        G("field","V_loop_cx",V_loop_cx);
+        G("field","V_loop_cy",V_loop_cy);
+        G("field","V_loop_rx",V_loop_rx);
+        G("field","V_loop_ry",V_loop_ry);
         G("field","spitzer_exp",spitzer_exp);
         G("field","Bz_ext",Bz_ext);
-        GI("field","poisson_iters",poisson_iters);
         GI("field","update_every",field_update_every);
-        G("field","sor_omega",sor_omega);
+        GI("field","j_smooth_window",j_smooth_window);
         G("field","inv_aspect_ratio",inv_aspect_ratio);
         G("field","cent_C0",cent_C0);
         G("field","cent_bias_cterm",cent_bias_cterm);
     }
     if (c["charge"]) {
         auto ch = c["charge"];
+        if (ch["ionization_k"]) p.ionization_k = ch["ionization_k"].as<float>();
         if (ch["mass_scale"]) p.charge_mass_scale = ch["mass_scale"].as<float>();
         if (ch["R0"]) p.charge_R0 = ch["R0"].as<float>();
         if (ch["j_scale"]) p.charge_j_scale = ch["j_scale"].as<float>();

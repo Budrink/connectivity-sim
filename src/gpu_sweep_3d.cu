@@ -25,7 +25,7 @@ struct SweepPoint {
 static SweepPoint run_one(aniso::gpu::GpuGrid& grid, SimParams p,
                           int warmup, int measure, int metric_every) {
     SweepPoint pt{};
-    pt.Ip     = p.V_loop;
+    pt.Ip     = p.V_loop_amp;
     pt.Bz     = p.Bz_ext;
     pt.gkappa = p.grad_kappa;
     pt.power  = p.heater_power;
@@ -154,8 +154,11 @@ int main(int argc, char* argv[]) {
     base.heat_rx = 0.2f; base.heat_ry = 0.2f; base.heat_rz = 0.3f;
     base.heat_peak = 1.0f;
     base.spitzer_exp = 1.5f;
-    base.poisson_iters = 64;
-    base.sor_omega = 1.7f;
+    // The sweep treats V_loop_amp as a global drive level (preserves the old
+    // Ip-sweep semantics). Wide Gaussian radii flatten V across the cord.
+    base.V_loop_offset = 0.0f;
+    base.V_loop_cx = 0.5f; base.V_loop_cy = 0.5f;
+    base.V_loop_rx = 10.0f; base.V_loop_ry = 10.0f;
     base.field_update_every = 1;
 
     float Ips[]     = {1.0f, 3.0f, 5.0f, 10.0f};
@@ -182,7 +185,7 @@ int main(int argc, char* argv[]) {
     for (int iG = 0; iG < nG; iG++)
     for (int iP = 0; iP < nP; iP++) {
         SimParams p = base;
-        p.V_loop       = Ips[iI];
+        p.V_loop_amp   = Ips[iI];
         p.Bz_ext       = Bzs[iB];
         p.grad_kappa   = gkappas[iG];
         p.heater_power = powers[iP];
@@ -226,7 +229,7 @@ int main(int argc, char* argv[]) {
             if (mI == 1 && mB == 1) continue;
 
             SimParams p = base;
-            p.V_loop       = fmaxf(seed.Ip * muls[mI], 0.01f);
+            p.V_loop_amp   = fmaxf(seed.Ip * muls[mI], 0.01f);
             p.Bz_ext       = fmaxf(seed.Bz * muls[mB], 0.5f);
             p.grad_kappa   = seed.gkappa;
             p.heater_power = seed.power;

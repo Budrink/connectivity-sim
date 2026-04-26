@@ -996,7 +996,7 @@ int main(int argc, char** argv) {
     bool  show_3d = true;
     int   vol_data_mode = 0;  // 0=E, 1=m, 2=E/m, 3=|J|, 4=charge q
     float vol_em_max = 15.0f; // upper scale for 3D E/m mode
-    float vol_J_max = 5.0f;
+    float vol_J_max = 1e-3f;
     // Zero voxels with |J| < cut * max(|J|) in frame; colormap still uses Vol |J| max (no rescale).
     float vol_J_low_cut = 0.f;
     int   z_slice = 0;
@@ -1186,6 +1186,20 @@ int main(int argc, char** argv) {
         }
 
         // ===== Control Panel =====
+        //
+        // Sections (top to bottom) follow the physical pipeline:
+        //   1. Run controls               — start / stop / step
+        //   2. Initial cord               — how the plasma is laid down at t=0
+        //   3. Acceptance kinematics      — m0, alpha_m, alpha_e, mass-FP fix
+        //   4. Heater                     — Q sources (constant / pulsed / target / beams)
+        //   5. Loop voltage drive         — signed Gaussian V(x,y); ohmic + counter-EMF
+        //   6. Magnetic field             — external B_ext (no Poisson self-field)
+        //   7. Charge / current transport — ionization, R0, current snapshot, Ampere k
+        //   8. Numerics (Sab / S clamp)   — l0, eigenvalue caps, kappa, E_ref
+        //   9. Wall                       — cooling, melt cap, sink gain, radiation
+        //  10. Disruption heuristics      — soft/hard auto-pause (GUI only)
+        //  11. Equilibrium                — optional real-tokamak geometry
+        //  12. Visualization              — colormap scales, 3D volume, mass/charge tints
         {
             ImGui::SetNextWindowPos(ImVec2(0, status_bar_h));
             ImGui::SetNextWindowSize(ImVec2(controls_panel_w, io.DisplaySize.y - status_bar_h));
@@ -1193,194 +1207,271 @@ int main(int argc, char** argv) {
 
             ImGui::PushItemWidth(controls_slider_w);
 
+            auto& pp = grid.params();
+
+            // -----------------------------------------------------------------
+            // 1. Run controls
+            // -----------------------------------------------------------------
             if (ImGui::Button(paused ? "Resume" : "Pause")) {
                 if (paused && dtrack.hard_disruption)
                     dtrack.hard_disruption = false;
                 paused = !paused;
             }
             ImGui::SameLine();
-            if (ImGui::Button("Reset")) { grid.reset(); ts = TimeSeries(4000); dtrack.reset(); paused = true; }
+            if (ImGui::Button("Reset")) {
+                grid.reset();
+                ts = TimeSeries(4000);
+                dtrack.reset();
+                paused = true;
+            }
             ImGui::SameLine();
             if (ImGui::Button("Step")) { grid.step(); }
 
             ImGui::SliderInt("Steps/frame", &steps_per_frame, 1, 32);
-            ImGui::SliderFloat("Map size", &map_size, 200, 600);
 
-            auto& pp = grid.params();
+            // -----------------------------------------------------------------
+            // 2. Initial cord (geometry + mass distribution at t=0)
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Initial cord", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SliderFloat("cord_radius (× wall_radius)", &pp.cord_radius, 0.01f, 1.0f, "%.2f");
+                ImGui::SliderFloat("cord_mass (mean per cell)",   &pp.cord_mass,   0.01f, 10.0f, "%.2f");
+                ImGui::SliderFloat("cord cx",                     &pp.cord_cx,      0.0f,  1.0f);
+                ImGui::SliderFloat("cord cy",                     &pp.cord_cy,      0.0f,  1.0f);
+                ImGui::SliderFloat("cord mass noise",             &pp.cord_mass_noise, 0.0f, 1.0f, "%.3f");
+                ImGui::SliderFloat("cord xy wander (per z)",      &pp.cord_xy_wander,  0.0f, 0.25f, "%.3f");
+                ImGui::TextDisabled("Random m in r<R, Σm=cord_mass·N_cells_in_R; wander+noise in weights. Click Reset to apply.");
+            }
 
-            ImGui::Separator(); ImGui::Text("Plasma Medium");
-            ImGui::SliderFloat("cord_radius (outer R)", &pp.cord_radius, 0.1f, 1.0f, "%.2f");
-            ImGui::SliderFloat("cord_mass (mean / cell in R)", &pp.cord_mass, 0.01f, 10.0f, "%.2f");
-            ImGui::SliderFloat("cord cx", &pp.cord_cx, 0.0f, 1.0f);
-            ImGui::SliderFloat("cord cy", &pp.cord_cy, 0.0f, 1.0f);
-            ImGui::SliderFloat("cord mass noise", &pp.cord_mass_noise, 0.0f, 1.0f, "%.3f");
-            ImGui::SliderFloat("cord xy wander (z)", &pp.cord_xy_wander, 0.0f, 0.25f, "%.3f");
-            ImGui::TextDisabled("Random m in r<R, Σm=cord_mass*N_cells_in_R; wander+noise in weights. Reset.");
-            ImGui::SliderFloat("m0 (accept)", &pp.m0, 0.01f, 5.0f, "%.2f");
-            ImGui::SliderFloat("alpha_m (Sab mass)", &pp.alpha_m, 0.0f, 3.0f, "%.2f");
-            ImGui::SliderFloat("alpha_e (Sab energy)", &pp.alpha_e, 0.0f, 3.0f, "%.2f");
-            {
+            // -----------------------------------------------------------------
+            // 3. Acceptance kinematics
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Acceptance", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SliderFloat("m0 (heating saturation)", &pp.m0,      0.01f, 5.0f, "%.2f");
+                ImGui::SliderFloat("alpha_m (Sab mass)",      &pp.alpha_m, 0.0f,  3.0f, "%.2f");
+                ImGui::SliderFloat("alpha_e (Sab energy)",    &pp.alpha_e, 0.0f,  3.0f, "%.2f");
                 bool mfp = pp.mass_fp_fix != 0;
-                if (ImGui::Checkbox("Mass FP fix (Σm after exchange)", &mfp))
+                if (ImGui::Checkbox("Mass FP fix (Σm post-exchange)", &mfp))
                     pp.mass_fp_fix = mfp ? 1 : 0;
+                ImGui::TextDisabled("Rescale plasma m so Σm matches post-prepare; q recomputed from (E,m).");
+            }
+
+            // -----------------------------------------------------------------
+            // 4. Heater (Q sources)
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Heater", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const char* htypes[] = {"constant","pulsed","event_driven","aniso_aware","target","beam_array"};
+                ImGui::Combo("Heater type", &pp.heater_type, htypes, 6);
+                if (pp.heater_type == HEAT_BEAM_ARRAY) {
+                    ImGui::SliderInt  ("n_beams",      &pp.n_beams,      1, 48);
+                    ImGui::SliderFloat("beam_power",   &pp.beam_power,   1.0f, 5000.0f, "%.0f");
+                    ImGui::SliderFloat("beam_sigma_r", &pp.beam_sigma_r, 0.01f, 0.15f, "%.3f");
+                    ImGui::SliderFloat("beam_sigma_z", &pp.beam_sigma_z, 0.01f, 0.20f, "%.3f");
+                    ImGui::SliderFloat("beam_r0",      &pp.beam_r0,      0.0f,  0.4f,  "%.3f");
+                } else {
+                    ImGui::SliderFloat("Power", &pp.heater_power, 0.0f, 50.0f);
+                    if (pp.heater_type == HEAT_PULSED) {
+                        ImGui::SliderFloat("Period##heat", &pp.heater_period, 0.1f, 20.0f);
+                        ImGui::SliderFloat("Duty##heat",   &pp.heater_duty,   0.0f, 1.0f);
+                    }
+                    if (pp.heater_type == HEAT_EVENT_DRIVEN || pp.heater_type == HEAT_ANISO_AWARE) {
+                        ImGui::SliderFloat("Trigger##heat",   &pp.heater_trigger,    0.0f, 3.0f);
+                        ImGui::SliderFloat("Obs delay##heat", &pp.heater_obs_delay, 0.0f, 5.0f, "%.3f");
+                    }
+                    if (pp.heater_type == HEAT_TARGET) {
+                        ImGui::SliderFloat("E_target", &pp.heater_E_target, 0.0f, 10.0f);
+                        ImGui::SliderFloat("k_heat",   &pp.heater_k_heat,   0.0f, 10.0f);
+                    }
+                    ImGui::SliderFloat("Heat cx",   &pp.heat_cx,   0.0f,  1.0f);
+                    ImGui::SliderFloat("Heat cy",   &pp.heat_cy,   0.0f,  1.0f);
+                    ImGui::SliderFloat("Heat rx",   &pp.heat_rx,   0.01f, 0.5f);
+                    ImGui::SliderFloat("Heat ry",   &pp.heat_ry,   0.01f, 0.5f);
+                    ImGui::SliderFloat("Heat peak", &pp.heat_peak, 0.0f,  5.0f);
+                    ImGui::TextDisabled("heat_cz/rz are init-only; Qh uses xy Gaussian (see YAML).");
+                }
+                ImGui::SliderFloat("Response tau",     &pp.heater_response_tau, 0.0f, 5.0f, "%.3f");
+                ImGui::SliderFloat("Absorption E_abs", &pp.heat_E_abs,           0.0f, 50.0f, "%.1f");
+                if (pp.heat_E_abs > 0.0f)
+                    ImGui::Text("  Q factor at E=1: %.2f", 1.0f / (1.0f + 1.0f / pp.heat_E_abs));
+            }
+
+            // -----------------------------------------------------------------
+            // 5. Loop voltage drive (3D only)
+            //    Signed Gaussian profile: forward drive in the centre, optional
+            //    counter-drive ring on the tail when V_loop_offset < 0.
+            // -----------------------------------------------------------------
+            if (pp.Nz > 1 &&
+                ImGui::CollapsingHeader("Loop voltage drive (V profile)", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::TextDisabled("V(x,y) = offset + amp·exp(-½·((x-cx)²/rx² + (y-cy)²/ry²))");
+                ImGui::SliderFloat("V_loop amp (peak)",    &pp.V_loop_amp,    -20.0f, 20.0f, "%.3f");
+                ImGui::SliderFloat("V_loop offset (tail)", &pp.V_loop_offset, -20.0f, 20.0f, "%.3f");
+                ImGui::SliderFloat("V_loop cx",            &pp.V_loop_cx,      0.0f,  1.0f,  "%.3f");
+                ImGui::SliderFloat("V_loop cy",            &pp.V_loop_cy,      0.0f,  1.0f,  "%.3f");
+                ImGui::SliderFloat("V_loop rx",            &pp.V_loop_rx,      0.01f, 1.0f,  "%.3f");
+                ImGui::SliderFloat("V_loop ry",            &pp.V_loop_ry,      0.01f, 1.0f,  "%.3f");
                 ImGui::TextDisabled(
-                    "Rescale plasma m,q so Σm matches post-prepare; damps float rounding drift.");
+                    "offset<0 → counter-driven outer ring (source of ExB shear).\n"
+                    "Sign of V is preserved in j_half (V<0 → counter-EMF cooling).");
             }
 
-            ImGui::Separator(); ImGui::Text("Wall");
-            ImGui::SliderFloat("wall_cool", &pp.wall_cooling, 0.1f, 50.0f, "%.1f");
-            ImGui::SliderFloat("wall_Emax", &pp.wall_E_max, 1.0f, 500.0f, "%.0f");
-            ImGui::SliderFloat("wall sink heat gain", &pp.wall_sink_E_gain, 0.0f, 200.0f, "%.1f");
-            ImGui::SliderFloat("wall edge mass (E exchange)", &pp.wall_edge_mass, 0.5f, 200.0f, "%.1f");
-            ImGui::SliderFloat("rad_alpha (m E^2 loss)", &pp.rad_alpha, 0.0f, 1.0f, "%.5f");
-
-            ImGui::Separator(); ImGui::Text("Heater");
-            const char* htypes[] = {"constant","pulsed","event_driven","aniso_aware","target","beam_array"};
-            ImGui::Combo("Heater", &pp.heater_type, htypes, 6);
-            if (pp.heater_type == HEAT_BEAM_ARRAY) {
-                ImGui::SliderInt("n_beams", &pp.n_beams, 1, 48);
-                ImGui::SliderFloat("beam_power", &pp.beam_power, 1.0f, 5000.0f, "%.0f");
-                ImGui::SliderFloat("beam_sigma_r", &pp.beam_sigma_r, 0.01f, 0.15f, "%.3f");
-                ImGui::SliderFloat("beam_sigma_z", &pp.beam_sigma_z, 0.01f, 0.2f, "%.3f");
-                ImGui::SliderFloat("beam_r0", &pp.beam_r0, 0.0f, 0.4f, "%.3f");
-            } else {
-                ImGui::SliderFloat("Power", &pp.heater_power, 0, 50.0f);
-                if (pp.heater_type == HEAT_PULSED) {
-                    ImGui::SliderFloat("Period##heat", &pp.heater_period, 0.1f, 20.0f);
-                    ImGui::SliderFloat("Duty##heat", &pp.heater_duty, 0.0f, 1.0f);
-                }
-                if (pp.heater_type == HEAT_EVENT_DRIVEN || pp.heater_type == HEAT_ANISO_AWARE) {
-                    ImGui::SliderFloat("Trigger##heat", &pp.heater_trigger, 0.0f, 3.0f);
-                    ImGui::SliderFloat("Obs delay##heat", &pp.heater_obs_delay, 0.0f, 5.0f, "%.3f");
-                }
-                if (pp.heater_type == HEAT_TARGET) {
-                    ImGui::SliderFloat("E_target (heat)", &pp.heater_E_target, 0, 10.0f);
-                    ImGui::SliderFloat("k_heat", &pp.heater_k_heat, 0, 10.0f);
-                }
-                ImGui::SliderFloat("Heat cx", &pp.heat_cx, 0.0f, 1.0f);
-                ImGui::SliderFloat("Heat cy", &pp.heat_cy, 0.0f, 1.0f);
-                ImGui::SliderFloat("Heat rx", &pp.heat_rx, 0.01f, 0.5f);
-                ImGui::SliderFloat("Heat ry", &pp.heat_ry, 0.01f, 0.5f);
-                ImGui::SliderFloat("Heat peak", &pp.heat_peak, 0.0f, 5.0f);
-                ImGui::TextDisabled("heat_cz/rz: init & heat_profile only; Qh uses xy Gaussian (see YAML).");
+            // -----------------------------------------------------------------
+            // 6. Magnetic field (external, axial / toroidal)
+            // -----------------------------------------------------------------
+            if (pp.Nz > 1 &&
+                ImGui::CollapsingHeader("Magnetic field", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::SliderFloat("Bz_ext (axial / toroidal)", &pp.Bz_ext,
+                                   1e-6f, 1000.0f, "%.4g", ImGuiSliderFlags_Logarithmic);
+                ImGui::TextDisabled("Log scale ~10⁻⁶…1000; the slider cannot reach exact zero.");
+                ImGui::SliderFloat("inv_aspect_ratio (a/R0)", &pp.inv_aspect_ratio,
+                                   0.0f, 10.0f, "%.2f");
+                ImGui::SliderFloat("C0 (C_mid inner x)", &pp.cent_C0, 0.1f, 5.0f, "%.2f");
             }
-            ImGui::SliderFloat("Response tau", &pp.heater_response_tau, 0.0f, 5.0f, "%.3f");
-            ImGui::SliderFloat("Absorption E_abs", &pp.heat_E_abs, 0.0f, 50.0f, "%.1f");
-            if (pp.heat_E_abs > 0.0f)
-                ImGui::Text("  Q factor at E=1: %.2f", 1.0f/(1.0f + 1.0f/pp.heat_E_abs));
 
-            ImGui::Separator(); ImGui::Text("Sab / S clamp (k_exchange, k_prepare)");
-            ImGui::SliderFloat("kappa (aniso)", &pp.grad_kappa, 0.0f, 50.0f);
-            ImGui::SliderFloat("E_ref", &pp.grad_E_ref, 0.1f, 10.0f);
-            ImGui::SliderFloat("eig_lo", &pp.eig_lo, 0.01f, 5.0f, "%.2f");
-            ImGui::SliderFloat("eig_hi (cap)", &pp.eig_hi, 100.0f, 1e4f, "%.0f");
-            ImGui::SliderFloat("l0 (Sab scale)", &pp.l0, 0.01f, 5.0f, "%.3f");
-
-            if (pp.Nz > 1) {
-                ImGui::Separator(); ImGui::Text("Self-consistent B-field");
-                ImGui::SliderInt("field update N", &pp.field_update_every, 0, 100);
+            // -----------------------------------------------------------------
+            // 7. Charge / current transport (3D only)
+            // -----------------------------------------------------------------
+            if (pp.Nz > 1 &&
+                ImGui::CollapsingHeader("Charge / current transport", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                ImGui::SliderFloat("ionization k (Q = f·M)", &pp.ionization_k,
+                                   1e-6f, 50.0f, "%.4g", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("charge R0", &pp.charge_R0, 0.01f, 50.0f, "%.2f");
+                ImGui::SliderInt  ("J snapshot every N steps", &pp.field_update_every, 0, 100);
                 if (pp.field_update_every > 0) {
-                    ImGui::SliderFloat("V_loop (Pv)", &pp.V_loop, 0.0f, 10.0f, "%.3f");
-                    ImGui::SliderFloat("Bz_ext", &pp.Bz_ext, 0.0f, 50.0f, "%.2f");
-                    ImGui::SliderFloat("charge_mass_scale", &pp.charge_mass_scale, 0.0f, 5.0f, "%.2f");
-                    ImGui::SliderFloat("charge R0", &pp.charge_R0, 0.01f, 50.0f, "%.2f");
-                    ImGui::SliderFloat("charge_j_scale", &pp.charge_j_scale, 1e-6f, 10.0f, "%.5f");
-                    ImGui::TextDisabled("J = j_acc * j_scale / (fe*dt*face); calibrates |B| from MC charge hops");
-                    ImGui::SliderFloat("inv_aspect (a/R0)", &pp.inv_aspect_ratio, 0.0f, 10.0f, "%.2f");
-                    ImGui::SliderFloat("C0 (C_mid inner x)", &pp.cent_C0, 0.1f, 5.0f, "%.2f");
-                    ImGui::SliderInt("SOR iters", &pp.poisson_iters, 5, 2000);
-                    ImGui::SliderFloat("SOR omega", &pp.sor_omega, 1.0f, 1.95f, "%.2f");
+                    ImGui::SliderFloat("charge_j_scale (Ampere k)", &pp.charge_j_scale,
+                                       1e-6f, 1e6f, "%.5g", ImGuiSliderFlags_Logarithmic);
+                    ImGui::SliderInt("j smooth window (W)", &pp.j_smooth_window, 1, 1024);
+                    ImGui::TextDisabled(
+                        "j_acc EMA, n=1/W; J = j_acc snapshot refreshed every N steps.\n"
+                        "Pi_B = (−|B_ext×ê| + k·F·ê / (dm_q²+ε)) · f_a, F=(J_a·J_b)−(J_a·ê)(J_b·ê).");
+                } else {
+                    ImGui::TextDisabled("N=0: J snapshot frozen; Ampere term k·F·ê uses last J.");
                 }
                 ImGui::Text("Ip (emergent, /Nz): %.4f",
                             grid.metrics().Ip_total / fmaxf((float)pp.Nz, 1.0f));
+                ImGui::Text("max|Jz|=%.3g  max|B_pol_self|=%.3g  max|(J×B)·r̂|=%.3g",
+                            grid.metrics().max_Jz_abs,
+                            grid.metrics().max_Bpol,
+                            grid.metrics().max_JxB_r);
             }
 
-            ImGui::Separator(); ImGui::Text("Thermal quench (physics)");
-            ImGui::SliderFloat("beta_limit (center_E)", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
-            ImGui::TextDisabled("0 = off. Exceeding pauses sim (hard) via metrics center_E.");
+            // -----------------------------------------------------------------
+            // 8. Numerics (Sab / S clamp)
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Numerics (Sab / S clamp)")) {
+                ImGui::SliderFloat("kappa (aniso)", &pp.grad_kappa, 0.0f,    50.0f);
+                ImGui::SliderFloat("E_ref",         &pp.grad_E_ref, 0.1f,    10.0f);
+                ImGui::SliderFloat("eig_lo",        &pp.eig_lo,     0.01f,   5.0f, "%.2f");
+                ImGui::SliderFloat("eig_hi (cap)",  &pp.eig_hi,     100.0f,  1e4f, "%.0f");
+                ImGui::SliderFloat("l0 (Sab floor)",&pp.l0,         0.01f,   5.0f, "%.3f");
+            }
 
-            ImGui::Separator(); ImGui::Text("Disruption heuristics (auto-pause)");
-            ImGui::SliderFloat("Wall flux soft (x EMA)", &dtrack.wf_spike_ratio, 1.2f, 10.0f, "%.1f");
-            ImGui::SliderFloat("Wall flux hard (x EMA)", &dtrack.wf_hard_ratio, 2.0f, 16.0f, "%.1f");
-            ImGui::SliderInt("Warmup steps (no alerts)", &dtrack.warmup_steps, 0, 20000);
-            ImGui::TextDisabled(
-                "Soft spike: flux > soft×EMA. Hard pause: flux > hard×EMA, or wall melt/contact, "
-                "or beta. Soft can clear if flux < 1.2×EMA ~0.5s sim time. NaN/overflow always hard.");
+            // -----------------------------------------------------------------
+            // 9. Wall
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Wall")) {
+                ImGui::SliderFloat("wall cooling",        &pp.wall_cooling,     0.1f,   50.0f, "%.1f");
+                ImGui::SliderFloat("wall E_max (melt)",   &pp.wall_E_max,       1.0f,  500.0f, "%.0f");
+                ImGui::SliderFloat("wall sink heat gain", &pp.wall_sink_E_gain, 0.0f,  200.0f, "%.1f");
+                ImGui::SliderFloat("wall edge mass (E exchange)", &pp.wall_edge_mass, 0.5f, 200.0f, "%.1f");
+                ImGui::SliderFloat("rad_alpha (m·E²)",    &pp.rad_alpha,        0.0f,    1.0f, "%.5f");
+            }
 
-            if (grid.has_equilibrium()) {
-                ImGui::Separator(); ImGui::Text("Equilibrium");
+            // -----------------------------------------------------------------
+            // 10. Disruption heuristics + thermal quench (auto-pause logic)
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Disruption / safety")) {
+                ImGui::SliderFloat("beta limit (center_E)", &pp.beta_limit, 0.0f, 500.0f, "%.0f");
+                ImGui::TextDisabled("0 = off. Pauses (hard) when center_E exceeds beta_limit.");
+                ImGui::Spacing();
+                ImGui::SliderFloat("Wall flux soft (× EMA)", &dtrack.wf_spike_ratio, 1.2f, 10.0f, "%.1f");
+                ImGui::SliderFloat("Wall flux hard (× EMA)", &dtrack.wf_hard_ratio,  2.0f, 16.0f, "%.1f");
+                ImGui::SliderInt  ("Warmup steps (no alerts)", &dtrack.warmup_steps,  0, 20000);
+                ImGui::TextDisabled(
+                    "Soft spike: flux > soft·EMA. Hard pause: flux > hard·EMA, wall melt/contact, "
+                    "or beta. Soft clears when flux < 1.2·EMA for ~0.5 s sim time. "
+                    "NaN/overflow always hard.");
+            }
+
+            // -----------------------------------------------------------------
+            // 11. Equilibrium (optional)
+            // -----------------------------------------------------------------
+            if (grid.has_equilibrium() &&
+                ImGui::CollapsingHeader("Equilibrium"))
+            {
                 bool eq_on = pp.use_equilibrium != 0;
-                if (ImGui::Checkbox("Use Equilibrium", &eq_on)) {
+                if (ImGui::Checkbox("Use equilibrium geometry", &eq_on)) {
                     pp.use_equilibrium = eq_on ? 1 : 0;
                     grid.reset(true);
-                    ts = TimeSeries(4000); dtrack.reset();
+                    ts = TimeSeries(4000);
+                    dtrack.reset();
                 }
-                
             }
 
-            ImGui::Separator(); ImGui::Text("3D Volume");
-            ImGui::Checkbox("Show 3D", &show_3d);
-            if (show_3d) {
-                const char* vol_modes[] = {
-                    "Energy", "Mass", "E / m",
-                    "|J|", "Charge q"};
-                ImGui::Combo("Vol data", &vol_data_mode, vol_modes, IM_ARRAYSIZE(vol_modes));
-                if (vol_data_mode == 3) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
-                    ImGui::TextWrapped(
-                        "|J| magnitude only; 3D scalar uses the same transfer function as Energy (hot + alpha). "
-                        "Direction mode: hue encodes J (no blue wedge). "
-                        "Same j_acc / Poisson J as below. Between field updates, |J| is frozen.");
-                    ImGui::PopStyleColor();
+            // -----------------------------------------------------------------
+            // 12. Visualization
+            // -----------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Visualization", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SliderFloat("Map size", &map_size, 200, 600);
+
+                ImGui::Checkbox("Auto-scale energy", &auto_scale);
+                if (!auto_scale) ImGui::SliderFloat("E_scale",     &E_scale,     0.1f,   20.0f);
+                ImGui::SliderFloat("aniso_scale", &aniso_scale, 0.1f,   20.0f);
+                ImGui::SliderFloat("gradE_scale", &gradE_scale, 1.0f, 1000.0f);
+                if (Nz > 1) {
+                    ImGui::SliderFloat("|J| max (slice + 3D)", &vol_J_max,
+                                       1e-8f, 500.0f, "%.6g", ImGuiSliderFlags_Logarithmic);
                 }
-                if (vol_data_mode == 4) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
-                    ImGui::TextWrapped(
-                        "Full scale = peak|q|×sliders below (Controls). "
-                        "Same hot TF as Energy; minus tinted red.");
-                    ImGui::PopStyleColor();
+
+                ImGui::Spacing();
+                ImGui::TextDisabled("Mass viz: blue-green log10(m), ~4 decades below m_max.");
+                ImGui::Checkbox("Mass autoscale", &mass_viz_autoscale);
+                ImGui::SliderInt("Mass autoscale every (frames)", &mass_autoscale_every, 1, 60);
+                if (!mass_viz_autoscale)
+                    ImGui::SliderFloat("Mass m_max (color scale)", &mass_col_manual_max,
+                                       1e-5f, 20.0f, "%.5f");
+
+                ImGui::Spacing();
+                ImGui::TextDisabled("Charge viz: peak|q| × first slider sets full scale; gamma lifts faint |q|.");
+                ImGui::SliderFloat("Charge full-scale × peak |q|", &g_charge_viz_peak_frac,
+                                   0.004f, 0.22f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Charge gamma",                 &g_charge_viz_gamma,
+                                   0.45f, 1.0f, "%.2f");
+
+                ImGui::Spacing();
+                ImGui::Checkbox("Show 3D volume", &show_3d);
+                if (show_3d) {
+                    const char* vol_modes[] = { "Energy", "Mass", "E / m", "|J|", "Charge q" };
+                    ImGui::Combo("Vol data", &vol_data_mode, vol_modes, IM_ARRAYSIZE(vol_modes));
+                    if (vol_data_mode == 3) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
+                        ImGui::TextWrapped(
+                            "|J| magnitude only; same hot transfer function as Energy. "
+                            "j_acc EMA updates each step, J snapshot every N steps.");
+                        ImGui::PopStyleColor();
+                    }
+                    if (vol_data_mode == 4) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.78f, 0.85f, 1.f));
+                        ImGui::TextWrapped(
+                            "Full scale = peak|q| × Charge slider above. "
+                            "Same hot TF as Energy; negative q tinted red.");
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::SliderFloat("Vol opacity", &vol_opacity, 0.1f, 5.0f, "%.2f");
+                    ImGui::Checkbox("3D uses 2D E_scale", &vol_use_map_E_scale);
+                    if (!vol_use_map_E_scale && vol_data_mode == 0)
+                        ImGui::SliderFloat("Vol E max", &vol_E_max, 0.5f, 200.0f, "%.1f");
+                    if (vol_data_mode == 2)
+                        ImGui::SliderFloat("Vol E/m max", &vol_em_max, 0.1f, 500.0f, "%.1f");
+                    if (vol_data_mode == 3) {
+                        ImGui::SliderFloat("Vol |J| low cut", &vol_J_low_cut, 0.f, 0.99f, "%.2f");
+                        ImGui::TextDisabled("Hide |J| < cut · max(|J|) this frame.");
+                    }
+                    ImGui::SliderFloat("Tube wall alpha", &wall_tube_alpha, 0.0f, 1.0f, "%.2f");
+                    ImGui::SliderInt  ("Vol depth",       &vol_display_nz,  1,  64);
                 }
-                ImGui::SliderFloat("Vol opacity", &vol_opacity, 0.1f, 5.0f, "%.2f");
-                ImGui::TextDisabled("Lower → more transparent volume (ray integral).");
-                ImGui::Checkbox("3D use 2D E_scale", &vol_use_map_E_scale);
-                if (!vol_use_map_E_scale && vol_data_mode == 0)
-                    ImGui::SliderFloat("Vol E max", &vol_E_max, 0.5f, 200.0f, "%.1f");
-                if (vol_data_mode == 2)
-                    ImGui::SliderFloat("Vol E/m max", &vol_em_max, 0.1f, 500.0f, "%.1f");
-                if (vol_data_mode == 3) {
-                    ImGui::SliderFloat("Vol |J| low cut", &vol_J_low_cut, 0.f, 0.99f, "%.2f");
-                    ImGui::TextDisabled(
-                        "Hide |J| < cut·max(|J|) this frame; top currents keep same color scale.");
-                }
-                ImGui::SliderFloat("Tube wall", &wall_tube_alpha, 0.0f, 1.0f, "%.2f");
-                ImGui::TextDisabled("Rim is thin/light; high values still add haze.");
-                ImGui::SliderInt("Vol depth", &vol_display_nz, 1, 64);
             }
-
-            ImGui::Separator();
-            ImGui::Checkbox("Auto-scale", &auto_scale);
-            if (!auto_scale) ImGui::SliderFloat("E_scale", &E_scale, 0.1f, 20.0f);
-            ImGui::SliderFloat("aniso_scale", &aniso_scale, 0.1f, 20.0f);
-            ImGui::SliderFloat("gradE_scale", &gradE_scale, 1.0f, 1000.0f);
-            if (Nz > 1) {
-                ImGui::SliderFloat("|J| max (Field map slice + 3D vol)", &vol_J_max, 0.01f, 500.0f, "%.2f");
-                ImGui::TextDisabled("Right tile in Field Maps = |J| at Z slice; same hot scale as 3D |J|.");
-            }
-
-            ImGui::Separator();
-            ImGui::Text("Mass (2D + vol): blue-green, log10(m), ~4 decades below m_max");
-            ImGui::Checkbox("Mass autoscale", &mass_viz_autoscale);
-            ImGui::SliderInt("Mass autoscale every (frames)", &mass_autoscale_every, 1, 60);
-            if (!mass_viz_autoscale)
-                ImGui::SliderFloat("Mass m_max (color scale)", &mass_col_manual_max, 1e-5f, 20.0f, "%.5f");
-
-            ImGui::Separator();
-            ImGui::Text("Charge (3D volume mode only; same TF as Energy)");
-            ImGui::SliderFloat("Charge full-scale × peak |q|", &g_charge_viz_peak_frac,
-                               0.004f, 0.22f, "%.4f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderFloat("Charge gamma (<1 lifts faint |q|)", &g_charge_viz_gamma,
-                               0.45f, 1.0f, "%.2f");
-            ImGui::TextDisabled("Smaller first slider → brighter (structure earlier). Defaults ~0.032 / 0.78.");
 
             ImGui::PopItemWidth();
             ImGui::End();
@@ -1462,7 +1553,7 @@ int main(int argc, char** argv) {
                 } else if (vol_data_mode == 2)
                     vol_hi = fmaxf(vol_em_max, 0.1f);
                 else if (vol_data_mode == 3)
-                    vol_hi = fmaxf(vol_J_max, 0.01f);
+                    vol_hi = fmaxf(vol_J_max, 1e-12f);
                 else if (vol_data_mode == 4 && Nz > 1) {
                     vol_lo = 0.0f;
                     vol_hi = 1.0f;
