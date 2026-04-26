@@ -79,7 +79,3 @@ src/gpu_sweep_gl.cu   Headless sweep binary
 configs/              YAML parameter files
 scripts/              Python analysis & plotting
 ```
-
-## Status
-
-Current model uses only the symmetric component `S`. The antisymmetric component `Ω` (magnetic field / vorticity) — which will enable the controller to redirect energy flows — is planned as the next major addition.
