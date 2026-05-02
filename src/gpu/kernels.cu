@@ -518,13 +518,25 @@ __global__ void k_prepare(GridFieldsPtrs f, SimParams p) {
 //                 dEa = −de − deQ + j_half,   dEb = +de + deQ + j_half,
 //                 j_acc += (1/W) · ½·dm_q · ê  (split between both endpoints).
 //
-//  Plasma–plasma energy exchange (2D Nz=1):
-//      π_arg = (Ea − de − Eb) + Pcx·m_shift/δM + l0·s_scaled·dist_fac
+//  Thermal driver — 2-T local detailed balance form.
+//      A move that transfers δE from a → b earns entropy
+//          ΔS_thermal = δE · (m_b/E_b − m_a/E_a)
+//      With normalized units (k_B=1, mass_ref=1) this is dimensionless and
+//      gives canonical Metropolis behaviour at uniform T (ΔS=0 ⇒ symmetric)
+//      and the correct heat-flow direction at gradient T_a≠T_b.
+//      This replaces the earlier raw (Ea − δE − Eb) form, which was a holdover
+//      from a non-dimensionalised proxy and only worked because energies were
+//      kept O(1) numerically.
+//
+//  Plasma–plasma mass+energy (2D Nz=1):
+//      π_arg = ΔS_thermal(de) + Pcx·m_shift/δM + l0·s_scaled·dist_fac
+//      where de = δM·E_a/m_a is the energy co-moving with mass δM.
 //
 //  Energy exchange (3D plasma↔plasma and plasma↔wall):
 //      Ps_en = s_scaled·dist_fac/Eref
-//      π_arg = (Ea − dE − Eb) + log(mass_pen) + l0·Ps_en
+//      π_arg = ΔS_thermal(δE) + log(mass_pen) + l0·Ps_en
 //      Plasma↔wall keeps the exp(l0) floor; plasma↔plasma drops it (legacy).
+//      Direction sign of ΔS_thermal flips for wall→plasma (reverse hop).
 //
 //  Plasma↔wall charge sink: same fused form, but P is forced to 1 afterwards
 //      (legacy ideal sink). Joule heat is split ½ to plasma, ½ to wall.
@@ -790,10 +802,14 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
                 }
             } else {
                 if (cur_Ea - de >= 0.f && cur_Eb + de >= 0.f) {
-                    // Fused 2D form: every exponent is folded into a single
-                    // pi_arg; s_scaled enters as l0·s_scaled. The final P =
-                    // l0 + exp(pi_arg) keeps l0 as an irreducible linear floor.
-                    float pi_arg = (cur_Ea - de - cur_Eb)
+                    // Fused 2D form: 2-T local detailed balance for the energy
+                    // co-moving with mass (de = δM · E_a/m_a), plus centrifugal
+                    // pressure drive on δM, plus operator l0·s_scaled floor.
+                    //   ΔS_thermal = de · (m_b/E_b − m_a/E_a)
+                    float inv_a = cur_ma / fmaxf(cur_Ea, 1e-30f);
+                    float inv_b = cur_mb / fmaxf(cur_Eb, 1e-30f);
+                    float dS_th = de * (inv_b - inv_a);
+                    float pi_arg = dS_th
                                  + Pcx * m_shift_avg / fmaxf(deltaM, EPS_TINY)
                                  + l0 * s_scaled * dist_fac;
                     float Pline = l0 + expf(pi_arg);
@@ -834,7 +850,6 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
         float wmb = cur_mb;
         float wEa = cur_Ea;
         float wEb = cur_Eb;
-        const float en_met_eps = 1e-8f;
         float Eref = fmaxf(p.grad_E_ref, 1e-20f);
         float Ps_en = dist_fac * s_scaled / Eref;
         float m_w = fmaxf(p.wall_edge_mass, 1e-20f);
@@ -847,13 +862,19 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
                     float u_amt_e = gpu_rand_uniform(p.seed, edge_key, step, 72u);
                     float deltaE = u_amt_e * wEa;
                     if (deltaE > 1e-30f) {
-                        // Fused: Metropolis argument + log(mass-ratio penalty) +
-                        // l0·Ps_en collapsed into one exponent; the explicit l0
-                        // term keeps a linear acceptance floor.
+                        // Two-temperature local detailed balance.
+                        //   ΔS_thermal = δE · (m_b/E_b − m_a/E_a)
+                        // For δE flowing a → wall (wall is acceptor):
+                        //   m_a, E_a   = wma, wEa     (donor, plasma side)
+                        //   m_b, E_b   = m_w, wall_E  (acceptor, wall side)
+                        // log(mass-ratio) penalty stays as a heuristic heat-capacity
+                        // weighting; l0·Ps_en is the operator structural floor.
+                        float inv_a = wma / fmaxf(wEa, 1e-30f);
+                        float inv_b = m_w / fmaxf(eb_side_wall, 1e-30f);
+                        float dS_th = deltaE * (inv_b - inv_a);
                         float mass_pen = (wma > m_w)
                             ? logf(m_w / fmaxf(wma, 1e-30f)) : 0.0f;
-                        float pi_arg = (wEa - deltaE - eb_side_wall + en_met_eps)
-                                     + mass_pen + l0 * Ps_en;
+                        float pi_arg = dS_th + mass_pen + l0 * Ps_en;
                         float P_en = l0 + expf(pi_arg);
                         P_en = fminf(fmaxf(P_en, 0.0f), 1.0f);
                         float u_gate_e = gpu_rand_uniform(p.seed, edge_key, step, 70u);
@@ -868,10 +889,15 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
                     float u_amt_e = gpu_rand_uniform(p.seed, edge_key, step, 72u);
                     float deltaE = u_amt_e * eb_side_wall;
                     if (deltaE > 1e-30f) {
+                        // Reverse direction: δE flows wall → plasma.
+                        // Plasma is acceptor (wma, wEa), wall is donor (m_w, wall_E).
+                        // ΔS = δE · (m_a/E_a − m_b/E_b) (sign flipped vs forward).
+                        float inv_a = wma / fmaxf(wEa, 1e-30f);
+                        float inv_b = m_w / fmaxf(eb_side_wall, 1e-30f);
+                        float dS_th = deltaE * (inv_a - inv_b);
                         float mass_pen = (m_w > wma)
                             ? logf(wma / fmaxf(m_w, 1e-30f)) : 0.0f;
-                        float pi_arg = (eb_side_wall - deltaE - wEa + en_met_eps)
-                                     + mass_pen + l0 * Ps_en;
+                        float pi_arg = dS_th + mass_pen + l0 * Ps_en;
                         float P_en = l0 + expf(pi_arg);
                         P_en = fminf(fmaxf(P_en, 0.0f), 1.0f);
                         float u_gate_e = gpu_rand_uniform(p.seed, edge_key, step, 70u);
@@ -887,12 +913,16 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
             float deltaE = u_amt_e * wEa;
             if (deltaE > 1e-30f) {
                 float eb_side = wEb;
-                // Fused plasma–plasma energy exchange: no separate l0 floor
-                // (legacy behavior); everything is rolled into a single exp.
+                // Plasma–plasma energy exchange: 2-T local detailed balance.
+                //   ΔS = δE · (m_b/E_b − m_a/E_a)
+                // Same form as plasma↔wall, only no separate l0 floor (legacy:
+                // everything is in a single exp here).
+                float inv_a = wma / fmaxf(wEa, 1e-30f);
+                float inv_b = wmb / fmaxf(eb_side, 1e-30f);
+                float dS_th = deltaE * (inv_b - inv_a);
                 float mass_pen = (wma > wmb)
                     ? logf(wmb / fmaxf(wma, 1e-30f)) : 0.0f;
-                float pi_arg = (wEa - deltaE - eb_side + en_met_eps)
-                             + mass_pen + l0 * Ps_en;
+                float pi_arg = dS_th + mass_pen + l0 * Ps_en;
                 float P_en = expf(pi_arg);
                 P_en = fminf(fmaxf(P_en, 0.0f), 1.0f);
                 float u_gate_e = gpu_rand_uniform(p.seed, edge_key, step, 70u);
@@ -940,6 +970,12 @@ __global__ void k_exchange(GridFieldsPtrs f, SimParams p,
             // f_q = dq/q_a. At the wall J_b ≈ 0 so Ampere ≈ 0; only Larmor
             // remains (and even that is overridden below: P is forced to 1
             // for the legacy ideal-sink behaviour).
+            //
+            // NOTE: pi_arg below is unused (P=1 override). If the ideal-sink
+            // override is ever removed, the (cur_Ea - cur_Eb) thermal term
+            // needs replacing with the 2-T entropy form used elsewhere in this
+            // kernel: δE · (m_b/E_b − m_a/E_a). Left as-is now to avoid
+            // touching dead code.
             const float coul_loss = (dq * dq) / fmaxf(R_edge, EPS_TINY);
             const float metropolis = (Pv * dq - coul_loss + (cur_Ea - cur_Eb));
             const float centrifugal = Pcx * m_shift_avg / fmaxf(dq, EPS_TINY);
